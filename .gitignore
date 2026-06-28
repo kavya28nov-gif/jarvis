@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Playwright persistent browser profile (WhatsApp session/login data)
+.jarvis_whatsapp_profile/
+
+# Spotify OAuth token cache
+.spotify_token_cache
+
+# Local runtime data / logs -- machine-specific, not meant to be shared
+jarvis.log
+scheduler_queue.json
+TASK_BOARD.md
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Local dev-tool config -- not project source, not meant to be public
+.claude/
+.idea/
