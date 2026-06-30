@@ -13,11 +13,29 @@ import json
 import threading
 import time
 import datetime
+import calendar
 import logging
 
 import ollama
 
 import jarvis_actions
+import cf_tracker
+import jarvis_memory
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+
+def _play_alert_sound():
+    """Plain system beep for the T-15 contest warning -- no new UI, no
+    extra audio assets, just winsound (stdlib on Windows)."""
+    if winsound:
+        try:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
 
 logger = logging.getLogger("jarvis.heartbeat")
 
@@ -55,16 +73,36 @@ def _ensure_task_board():
             f.write(_TASK_BOARD_TEMPLATE)
 
 
+PROGRESS_REMINDER_START_HOUR = 21  # 9 PM
+PROGRESS_REMINDER_END_HOUR = 24    # midnight
+
+
 class HeartbeatAgent:
     """on_state_change(state) is called when a background task starts
     ("background_processing") and again when it finishes ("idle") --
     main.py wires this to the orb's state so the rings reflect autonomous
-    work. on_state_change may be None to run headless without UI ties."""
+    work. on_state_change may be None to run headless without UI ties.
 
-    def __init__(self, on_state_change=None, interval=HEARTBEAT_INTERVAL_SECONDS):
+    on_notify(text) is called for things that should actually be spoken
+    out loud (e.g. the daily progress-log reminder), as opposed to silent
+    background task summaries.
+
+    on_checkin_trigger() is called to run the full interactive mood
+    check-in flow (3 spoken questions + mic listening) -- this needs
+    main.py's real speak/listen capability, so the heartbeat just fires
+    the callback rather than running the flow itself."""
+
+    def __init__(self, on_state_change=None, on_notify=None, on_checkin_trigger=None,
+                 interval=HEARTBEAT_INTERVAL_SECONDS):
         self.on_state_change = on_state_change
+        self.on_notify = on_notify
+        self.on_checkin_trigger = on_checkin_trigger
         self.interval = interval
         self._stop_flag = False
+        self._last_progress_reminder_key = None
+        self._last_monthly_chart_date = None
+        self._last_morning_checkin_date = None
+        self._last_distillation_date = None
         self._client = ollama.Client(host=OLLAMA_HOST)
         _ensure_task_board()
 
@@ -91,7 +129,119 @@ class HeartbeatAgent:
             except Exception as e:
                 logger.error(f"[heartbeat UI callback error] {e}")
 
+    def _check_progress_reminder(self):
+        """Deterministic, not LLM-decided -- whether you've logged today's
+        weights is a plain fact-check, not something worth risking a
+        model misjudging. Reminds at most once per hour, within the
+        9 PM-midnight window, and goes silent once logged. CF is no
+        longer part of this -- it's auto-tracked via cf_tracker now
+        (daily fetch + heartbeat contest monitor), so there's nothing
+        left to manually log; the CF-specific "go solve one" nudge in
+        jarvis_memory.check_nudges covers that instead."""
+        now = datetime.datetime.now()
+        if not (PROGRESS_REMINDER_START_HOUR <= now.hour < PROGRESS_REMINDER_END_HOUR):
+            return
+        hour_key = f"{now.date().isoformat()}-{now.hour}"
+        if self._last_progress_reminder_key == hour_key:
+            return
+
+        missing = []
+        if not jarvis_actions.has_logged_weights_today():
+            missing.append("today's weights")
+        if not missing:
+            return
+
+        self._last_progress_reminder_key = hour_key
+        if self.on_notify:
+            try:
+                self.on_notify(f"Sir, you still haven't logged {' and '.join(missing)}.")
+            except Exception as e:
+                logger.error(f"[heartbeat notify error] {e}")
+
+    def _check_monthly_charts(self):
+        """Deterministic, not LLM-decided -- generates this month's
+        progress charts once, on the last calendar day of the month.
+        Guarded so it only fires once per day even though the heartbeat
+        ticks every 30 min."""
+        today = datetime.date.today()
+        last_day_of_month = calendar.monthrange(today.year, today.month)[1]
+        if today.day != last_day_of_month:
+            return
+        if self._last_monthly_chart_date == today.isoformat():
+            return
+
+        self._last_monthly_chart_date = today.isoformat()
+        logger.info(f"[heartbeat] generating monthly progress charts for {today.year}-{today.month:02d}")
+        self._set_state("background_processing")
+        try:
+            result = jarvis_actions.generate_progress_charts(month=today.month, year=today.year)
+            logger.info(f"[heartbeat] {result}")
+        except Exception as e:
+            logger.error(f"[heartbeat monthly chart error] {e}")
+        finally:
+            self._set_state("idle")
+
+    def _check_cf_contests(self):
+        """Contest monitor -- T-60/T-15 reminders, auto-open at start,
+        post-contest analysis. One contest.list call per tick covers all
+        three (see cf_tracker.run_heartbeat_check), staying well within
+        CF's rate limit. Fails silently (logged, not raised) on any API
+        hiccup -- next tick just tries again."""
+        try:
+            cf_tracker.run_heartbeat_check(on_notify=self.on_notify, play_alert=_play_alert_sound)
+        except Exception as e:
+            logger.error(f"[heartbeat cf_tracker error] {e}")
+
+    def _check_nudges(self):
+        """Proactive nudges -- priority-ordered, one max per tick, each
+        gated by its own 4h cooldown persisted in jarvis_memory (survives
+        restarts). See jarvis_memory.check_nudges for the actual logic."""
+        try:
+            jarvis_memory.check_nudges(on_notify=self.on_notify, on_checkin_trigger=self.on_checkin_trigger)
+        except Exception as e:
+            logger.error(f"[heartbeat nudge error] {e}")
+
+    def _check_morning_checkin(self):
+        """Deterministic -- auto-triggers the mood check-in flow once per
+        day at 9 AM."""
+        now = datetime.datetime.now()
+        if now.hour != 9:
+            return
+        today = now.date().isoformat()
+        if self._last_morning_checkin_date == today:
+            return
+        self._last_morning_checkin_date = today
+        if self.on_checkin_trigger:
+            try:
+                self.on_checkin_trigger()
+            except Exception as e:
+                logger.error(f"[heartbeat morning checkin error] {e}")
+
+    def _check_nightly_distillation(self):
+        """Deterministic -- runs the weekly-events distillation once per
+        day at/after 11 PM. Fails silently (per spec) if Groq is
+        unreachable; jarvis_memory.distill_memory() handles that and
+        just returns False, so this simply retries next night."""
+        now = datetime.datetime.now()
+        if now.hour < 23:
+            return
+        today = now.date().isoformat()
+        if self._last_distillation_date == today:
+            return
+        self._last_distillation_date = today
+        try:
+            jarvis_memory.distill_memory()
+        except Exception as e:
+            logger.error(f"[heartbeat distillation error] {e}")
+
     def _tick(self):
+        self._check_progress_reminder()
+        self._check_monthly_charts()
+        self._check_cf_contests()
+        self._check_nudges()
+        self._check_morning_checkin()
+        self._check_nightly_distillation()
+
         with open(TASK_BOARD_PATH, "r", encoding="utf-8") as f:
             board = f.read()
 

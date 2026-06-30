@@ -5,6 +5,7 @@ import subprocess
 import webbrowser
 import datetime
 import base64
+import json
 import threading
 import shutil
 import urllib.parse
@@ -27,6 +28,20 @@ from dotenv import load_dotenv
 # script/test that imports this module directly still gets them, not
 # just the main.py entrypoint.
 load_dotenv()
+
+# Imported by name (not `import cf_tracker`) so FUNCTION_REGISTRY's
+# globals()[name] lookup below resolves these directly, same dispatch
+# pattern as every other manifest entry in this file.
+from cf_tracker import (
+    cf_rating, cf_today, cf_last_contest, cf_monthly_summary, cf_upcoming_contest,
+    build_cf_monthly_payload,
+)
+from jarvis_memory import check_in, memory_summary, whats_my_plan, last_time
+from easter_eggs import (
+    easter_dont_leave, easter_rumble, easter_inevitable, easter_rick,
+    easter_on_your_left, easter_evangelion, easter_mandalorian, easter_shirou,
+    easter_deathnote_chip, easter_mha, easter_keikaku, easter_pokemon,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +213,403 @@ def save_note(text):
     with open(NOTES_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] {text}\n")
     return "Note saved."
+
+
+# ---------------------------------------------------------------------------
+# Daily progress tracker (weekly lifting split, runs, CF problems)
+# ---------------------------------------------------------------------------
+
+PROGRESS_LOG_PATH = os.path.expanduser("~/jarvis_progress_log.json")
+
+# Your weekly split -- Monday is Day 1, Saturday is Day 6. Used so you can
+# just rattle off weights in order and have them matched to the right
+# exercise automatically, instead of naming each one every time.
+WEEKLY_ROUTINE = {
+    "Monday": [
+        "Seated row", "T-bar row", "Archer row", "Lat pulldown",
+        "Face pulls", "DB curls",
+    ],
+    "Tuesday": [
+        "Flat barbell bench", "Incline DB press", "Cable crossover",
+        "Seated shoulder press", "Face pulls", "Lateral raises",
+        "Tricep rope pushdown",
+    ],
+    "Wednesday": [
+        "Leg press", "Romanian deadlift", "Single-leg RDL",
+        "Walking lunges", "Leg extension", "Cable crunch",
+        "Hanging leg raise", "Plank",
+    ],
+    "Thursday": [
+        "Pull-ups", "Single-arm DB row", "Cable row", "Face pulls",
+        "Reverse flys", "Lat pulldown", "Hammer curls",
+    ],
+    "Friday": [
+        "Incline barbell press", "DB shoulder press", "Cable flys",
+        "Arnold press", "Lateral raises", "Rear delt flys",
+        "Tricep overhead extension",
+    ],
+    "Saturday": [],  # full-body metabolic / run day -- no fixed lift list
+}
+
+
+def _load_progress_log():
+    if not os.path.exists(PROGRESS_LOG_PATH):
+        return {}
+    with open(PROGRESS_LOG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_progress_log(data):
+    with open(PROGRESS_LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def todays_workout():
+    """Lists today's exercises from the weekly split, so you know what
+    you're about to log weights for."""
+    day_name = datetime.date.today().strftime("%A")
+    exercises = WEEKLY_ROUTINE.get(day_name, [])
+    if not exercises:
+        return f"{day_name}: no fixed lift list -- full-body/metabolic or rest day."
+    return f"{day_name}'s lifts: " + ", ".join(exercises)
+
+
+CF_LETTERS = ["A", "B", "C", "D", "E", "F", "G"]
+
+
+def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
+                  problems_solved=None, cf_breakdown=None):
+    """Logs today's numbers. `weights` is a list of numbers in the order
+    you say them, matched positionally to today's exercise list from
+    WEEKLY_ROUTINE (so you can just say "60, 25, 15, 40, 20, 15, 18" and
+    have each land on the right lift) -- OR pass `exercises` as a
+    {name: weight} dict directly if you want to name them explicitly or
+    only log some of today's lifts. `distance` (km) and `run_minutes`
+    (minutes taken) cover a run. `cf_breakdown` is a list of problem
+    counts in order A, B, C, D... (e.g. "3, 4, 1, 0" -> A=3, B=4, C=1,
+    D=0) and automatically sums into `problems_solved` -- or pass
+    `problems_solved` directly for just a total with no breakdown.
+    Call multiple times through the day -- each call only overwrites the
+    fields you actually pass."""
+    today = datetime.date.today().isoformat()
+    day_name = datetime.date.today().strftime("%A")
+    data = _load_progress_log()
+    entry = data.get(today, {})
+    entry.setdefault("exercises", {})
+
+    if weights is not None:
+        todays_list = WEEKLY_ROUTINE.get(day_name, [])
+        for name, w in zip(todays_list, weights):
+            entry["exercises"][name] = float(w)
+        leftover = len(weights) - len(todays_list)
+        if leftover > 0:
+            return (
+                f"Logged {len(todays_list)} of today's lifts, but you gave "
+                f"{leftover} extra number(s) with no matching exercise -- "
+                "check WEEKLY_ROUTINE or pass `exercises` explicitly instead."
+            )
+    if exercises is not None:
+        for name, w in exercises.items():
+            entry["exercises"][name] = float(w)
+
+    if distance is not None:
+        entry["distance"] = float(distance)
+    if run_minutes is not None:
+        entry["run_minutes"] = float(run_minutes)
+    if cf_breakdown is not None:
+        breakdown = {
+            letter: int(count)
+            for letter, count in zip(CF_LETTERS, cf_breakdown)
+            if int(count) > 0
+        }
+        entry["cf_breakdown"] = breakdown
+        entry["problems_solved"] = sum(int(c) for c in cf_breakdown)
+    elif problems_solved is not None:
+        entry["problems_solved"] = int(problems_solved)
+
+    data[today] = entry
+    _save_progress_log(data)
+
+    parts = []
+    if entry["exercises"]:
+        parts.append(f"{len(entry['exercises'])} lift(s) logged")
+    if "distance" in entry:
+        pace = ""
+        if "run_minutes" in entry and entry["distance"]:
+            pace = f" ({entry['run_minutes'] / entry['distance']:.1f} min/km)"
+        parts.append(f"{entry['distance']}km run" + (f" in {entry['run_minutes']}min{pace}" if "run_minutes" in entry else pace))
+    if "problems_solved" in entry:
+        if entry.get("cf_breakdown"):
+            breakdown_str = ", ".join(f"{k}: {v}" for k, v in entry["cf_breakdown"].items())
+            parts.append(f"{entry['problems_solved']} CF problems solved ({breakdown_str})")
+        else:
+            parts.append(f"{entry['problems_solved']} CF problems solved")
+    return f"Logged for today: {', '.join(parts) if parts else 'nothing yet'}."
+
+
+def has_logged_today():
+    """True the moment ANY field is logged for today. Kept for backwards
+    compatibility -- prefer has_logged_weights_today()/has_logged_cf_today()
+    when you need to know specifically which part is still missing."""
+    today = datetime.date.today().isoformat()
+    return today in _load_progress_log()
+
+
+def has_logged_weights_today():
+    today = datetime.date.today().isoformat()
+    entry = _load_progress_log().get(today, {})
+    return bool(entry.get("exercises"))
+
+
+def has_logged_cf_today():
+    today = datetime.date.today().isoformat()
+    entry = _load_progress_log().get(today, {})
+    return "problems_solved" in entry
+
+
+def show_progress(days=7):
+    """Summarizes the last `days` days -- per-exercise weight trend, run
+    pace trend, and CF problems trend."""
+    data = _load_progress_log()
+    if not data:
+        return "No progress logged yet. Try logging today's numbers first."
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=days - 1)
+    recent = sorted(
+        (date, entry) for date, entry in data.items()
+        if datetime.date.fromisoformat(date) >= cutoff
+    )
+    if not recent:
+        return f"No entries in the last {days} days."
+
+    def _trend(vals):
+        if len(vals) < 2:
+            return f"{vals[-1]}" if vals else "no data"
+        first, last = vals[0], vals[-1]
+        if last > first:
+            return f"up ({first} -> {last})"
+        elif last < first:
+            return f"down ({first} -> {last})"
+        return f"flat ({last})"
+
+    lines = [f"Progress over the last {len(recent)} logged day(s):"]
+
+    exercise_names = sorted({name for _, e in recent for name in e.get("exercises", {})})
+    for name in exercise_names:
+        vals = [e["exercises"][name] for _, e in recent if name in e.get("exercises", {})]
+        lines.append(f"- {name}: {_trend(vals)} kg")
+
+    distances = [e["distance"] for _, e in recent if "distance" in e]
+    if distances:
+        lines.append(f"- Distance run (km): {_trend(distances)}")
+    paces = [
+        e["run_minutes"] / e["distance"] for _, e in recent
+        if "distance" in e and "run_minutes" in e and e["distance"]
+    ]
+    if paces:
+        lines.append(f"- Run pace (min/km): {_trend([round(p, 1) for p in paces])}")
+
+    problems = [e["problems_solved"] for _, e in recent if "problems_solved" in e]
+    if problems:
+        lines.append(f"- CF problems solved: {_trend(problems)}")
+
+    return "\n".join(lines)
+
+
+PROGRESS_CHARTS_DIR = os.path.expanduser("~/Desktop/jarvis_progress_charts")
+
+
+def generate_progress_charts(month=None, year=None):
+    """Builds line/bar charts for a given month -- one per exercise
+    (weight over time), one for run pace, one for CF problems solved --
+    and saves them as PNGs in a dated subfolder. Defaults to the current
+    month if not specified."""
+    today = datetime.date.today()
+    month = int(month) if month else today.month
+    year = int(year) if year else today.year
+
+    data = _load_progress_log()
+    month_entries = sorted(
+        (date, entry) for date, entry in data.items()
+        if datetime.date.fromisoformat(date).month == month
+        and datetime.date.fromisoformat(date).year == year
+    )
+    if not month_entries:
+        return f"No logged entries for {year}-{month:02d}."
+
+    import matplotlib
+    matplotlib.use("Agg")  # headless -- no Tk window popping up mid-workout
+    import matplotlib.pyplot as plt
+
+    out_dir = os.path.join(PROGRESS_CHARTS_DIR, f"{year}-{month:02d}")
+    os.makedirs(out_dir, exist_ok=True)
+    saved = []
+
+    dates = [datetime.date.fromisoformat(d) for d, _ in month_entries]
+    day_labels = [d.strftime("%d") for d in dates]
+
+    # one weight line-chart per exercise
+    exercise_names = sorted({name for _, e in month_entries for name in e.get("exercises", {})})
+    for name in exercise_names:
+        xs, ys = [], []
+        for label, (_, e) in zip(day_labels, month_entries):
+            if name in e.get("exercises", {}):
+                xs.append(label)
+                ys.append(e["exercises"][name])
+        if len(ys) < 1:
+            continue
+        plt.figure(figsize=(8, 4))
+        plt.plot(xs, ys, marker="o", color="#ff6600")
+        plt.title(f"{name} -- {year}-{month:02d}")
+        plt.xlabel("Day")
+        plt.ylabel("Weight (kg)")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        safe_name = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+        path = os.path.join(out_dir, f"{safe_name}.png")
+        plt.savefig(path)
+        plt.close()
+        saved.append(path)
+
+    # bar chart: run pace (min/km) per logged run day
+    pace_xs, pace_ys = [], []
+    for label, (_, e) in zip(day_labels, month_entries):
+        if "distance" in e and "run_minutes" in e and e["distance"]:
+            pace_xs.append(label)
+            pace_ys.append(e["run_minutes"] / e["distance"])
+    if pace_ys:
+        plt.figure(figsize=(8, 4))
+        plt.bar(pace_xs, pace_ys, color="#3399ff")
+        plt.title(f"Run pace (min/km) -- {year}-{month:02d}")
+        plt.xlabel("Day")
+        plt.ylabel("min/km")
+        plt.grid(alpha=0.3, axis="y")
+        plt.tight_layout()
+        path = os.path.join(out_dir, "run_pace.png")
+        plt.savefig(path)
+        plt.close()
+        saved.append(path)
+
+    # bar chart: CF problems solved per day (total)
+    cf_xs, cf_ys = [], []
+    for label, (_, e) in zip(day_labels, month_entries):
+        if "problems_solved" in e:
+            cf_xs.append(label)
+            cf_ys.append(e["problems_solved"])
+    if cf_ys:
+        plt.figure(figsize=(8, 4))
+        plt.bar(cf_xs, cf_ys, color="#33cc66")
+        plt.title(f"CF problems solved (total) -- {year}-{month:02d}")
+        plt.xlabel("Day")
+        plt.ylabel("Problems solved")
+        plt.grid(alpha=0.3, axis="y")
+        plt.tight_layout()
+        path = os.path.join(out_dir, "cf_problems_total.png")
+        plt.savefig(path)
+        plt.close()
+        saved.append(path)
+
+    # line chart: CF problems solved per letter (A, B, C, D...) -- same
+    # per-item breakdown style as the per-exercise weight charts above
+    letters_present = sorted({l for _, e in month_entries for l in e.get("cf_breakdown", {})})
+    if letters_present:
+        plt.figure(figsize=(8, 4))
+        for letter in letters_present:
+            xs, ys = [], []
+            for label, (_, e) in zip(day_labels, month_entries):
+                if letter in e.get("cf_breakdown", {}):
+                    xs.append(label)
+                    ys.append(e["cf_breakdown"][letter])
+            if xs:
+                plt.plot(xs, ys, marker="o", label=f"Problem {letter}")
+        plt.title(f"CF problems solved by letter -- {year}-{month:02d}")
+        plt.xlabel("Day")
+        plt.ylabel("Problems solved")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(out_dir, "cf_problems_by_letter.png")
+        plt.savefig(path)
+        plt.close()
+        saved.append(path)
+
+    if not saved:
+        return f"No chartable data for {year}-{month:02d} (entries exist but had no weights/run/CF numbers)."
+
+    assessment = _get_hermes_assessment(month_entries, month, year)
+    if assessment:
+        with open(os.path.join(out_dir, "assessment.txt"), "w", encoding="utf-8") as f:
+            f.write(assessment)
+
+    subprocess.Popen(f'explorer "{out_dir}"', shell=True)
+    note = " Hermes left a note in assessment.txt." if assessment else ""
+    return f"Saved {len(saved)} chart(s) to {out_dir} (opened in Explorer).{note}"
+
+
+HERMES_ASSESSMENT_PROMPT = (
+    "You are reviewing someone's monthly fitness and Codeforces progress "
+    "log. All lifting weights are in KILOGRAMS, not pounds -- never say lbs. "
+    "Each day's entry may include `distance` (km) and `run_minutes` (time "
+    "taken to run that distance) for a run. Pace = run_minutes / distance: "
+    "a LOWER run_minutes for the same or similar distance means the person "
+    "got FASTER, which is IMPROVEMENT, not regression -- do not get this "
+    "backwards. There may also be a top-level `codeforces` key with "
+    "auto-tracked data (not manually logged): rating_start/rating_end/"
+    "rating_delta (CF rating change this month -- positive is good), "
+    "contests_participated, problems_solved, by_index (count per problem "
+    "letter A/B/C/D... -- solving harder/later letters consistently is a "
+    "stronger signal than just a high total), by_tag (topics practiced), "
+    "and contest_results (per-contest solved list and penalty -- lower "
+    "penalty for the same solve count is better). There may also be a "
+    "`mood` key from daily check-ins: checkins (how many check-ins this "
+    "month), avg_energy (1=low, 2=medium, 3=high), and rough_days (count "
+    "of days logged as mood=rough) -- mention if energy/mood looks "
+    "correlated with the other metrics. Look at all the raw data below "
+    "and write a short, honest assessment (4-6 sentences): are they "
+    "progressing well or stalling/regressing on each metric (lifting "
+    "weights, run pace, CF rating/problems/contest performance, mood/"
+    "energy)? Call out anything that looks genuinely good and anything "
+    "that looks weak or inconsistent. Be direct, not generic encouragement. "
+    "Plain text only, "
+    "no markdown."
+)
+
+
+def _get_hermes_assessment(month_entries, month, year):
+    """Asks the local Ollama 'hermes3' model for a qualitative verdict on
+    the month's raw numbers -- this runs during the same background tick
+    as chart generation, so Hermes's slower local inference doesn't cost
+    anything time-sensitive (unlike the real-time voice path, which uses
+    Groq instead). Includes the auto-tracked Codeforces payload (rating,
+    contests, by-index/by-tag breakdown) alongside the manual gym/run log,
+    so Hermes judges both halves together."""
+    try:
+        import ollama
+        payload = dict(month_entries)
+        try:
+            cf_payload = build_cf_monthly_payload(month, year)
+            payload["codeforces"] = cf_payload["codeforces"]
+        except Exception as e:
+            print(f"[hermes assessment] could not attach cf payload: {e}")
+        try:
+            import jarvis_memory
+            payload["mood"] = jarvis_memory.get_mood_summary_for_month(month, year)
+        except Exception as e:
+            print(f"[hermes assessment] could not attach mood payload: {e}")
+        raw = json.dumps(payload, indent=2)
+        client = ollama.Client(host="http://localhost:11434")
+        response = client.chat(
+            model="hermes3",
+            messages=[
+                {"role": "system", "content": HERMES_ASSESSMENT_PROMPT},
+                {"role": "user", "content": f"Data for {year}-{month:02d}:\n{raw}"},
+            ],
+            options={"temperature": 0.4},
+        )
+        return response["message"]["content"].strip()
+    except Exception as e:
+        print(f"[hermes assessment error] {e}")
+        return None
 
 
 def _popup(title, message):
@@ -619,6 +1031,14 @@ def start_focus_session(minutes=25):
     timer = threading.Timer(float(minutes) * 60, _end)
     timer.daemon = True
     timer.start()
+
+    # Lets the "no focus session logged today" nudge know it happened.
+    try:
+        import jarvis_memory
+        jarvis_memory.set_memory("last_focus_session_date", datetime.date.today().isoformat())
+    except Exception:
+        pass
+
     closed_msg = f" Closed: {', '.join(closed)}." if closed else ""
     return f"Focus session started for {minutes} minutes.{closed_msg}"
 
@@ -639,6 +1059,17 @@ def end_focus_session():
 def _call_groq(messages, model, max_tokens=2000):
     if not GROQ_API_KEY:
         return None, "GROQ_API_KEY environment variable is not set."
+
+    # Memory injection wraps every Groq call made through this helper
+    # (ask_ai, solve_from_screenshot) with a [JARVIS MEMORY] context
+    # block -- never rewrites the caller's messages, just prepends.
+    # Falls back to the original messages unchanged on any failure.
+    try:
+        import jarvis_memory
+        messages = jarvis_memory.inject_memory(messages)
+    except Exception:
+        pass
+
     response = requests.post(
         GROQ_API_URL,
         headers={
@@ -897,7 +1328,32 @@ FUNCTION_MANIFEST = [
     {"name": "open_terminal", "description": "Opens a terminal window, optionally at a path.", "args": {"path": "string, optional"}},
     {"name": "open_site", "description": "Opens a website (configured shortcut name or any URL/domain).", "args": {"name": "string"}},
     {"name": "take_screenshot", "description": "Takes a screenshot and saves it.", "args": {}},
-    {"name": "save_note", "description": "Appends a timestamped note to the notes file.", "args": {"text": "string"}},
+    {"name": "save_note", "description": "Appends a timestamped free-text note to the notes file. Do NOT use this for workout weights, run distance/time, or CF problem counts -- those always go through log_progress instead, even if the user just says a bare list of numbers with the word 'log'.", "args": {"text": "string"}},
+    {"name": "todays_workout", "description": "Lists today's lifts from the weekly workout split, in order.", "args": {}},
+    {"name": "log_progress", "description": "Logs today's gym/run/CF numbers. ALWAYS use this (never save_note) whenever the user says 'log' followed by a list of bare numbers (e.g. 'log 85 20 25 60 45 25') -- pass them as `weights` in the order given, and they'll be matched to today's exercises in order automatically. If the user names specific exercises, pass `exercises` as a {exercise_name: weight} object instead. For CF problems solved 'in order A, B, C, D' (e.g. 'I solved 3, 4, 1, 0 problems today'), pass `cf_breakdown` as a list of counts in that A/B/C/D... order -- it auto-sums into the total. Only pass the fields actually mentioned -- can be called multiple times per day.", "args": {"weights": "list of numbers, optional, weights in the order today's exercises are listed", "exercises": "object, optional, {exercise_name: weight_kg} for naming specific lifts", "distance": "number, optional, km run", "run_minutes": "number, optional, minutes taken for the run", "cf_breakdown": "list of ints, optional, CF problems solved per letter in order A, B, C, D...", "problems_solved": "int, optional, CF total with no breakdown"}},
+    {"name": "show_progress", "description": "Summarizes logged progress over the last N days -- per-exercise weight trend, run pace trend, and CF problems trend.", "args": {"days": "int, optional, default 7"}},
+    {"name": "generate_progress_charts", "description": "Builds and saves line/bar chart PNGs for a given month, defaulting to the current month: per-exercise weight over time, run pace, CF problems solved (total bar chart AND a per-letter A/B/C/D breakdown line chart, same style as the per-exercise charts), plus an assessment.txt written by the local Hermes model judging whether progress was good/bad on each metric. Opens the folder in Explorer when done.", "args": {"month": "int, optional, 1-12, defaults to current month", "year": "int, optional, defaults to current year"}},
+    {"name": "cf_rating", "description": "Current Codeforces rating (auto-tracked via the CF API) and the change vs one week ago.", "args": {}},
+    {"name": "cf_today", "description": "Problems solved on Codeforces today (auto-tracked), with problem names.", "args": {}},
+    {"name": "cf_last_contest", "description": "Breakdown of your most recently FINISHED Codeforces contest -- problems solved, first-AC time per problem, wrong-submission penalty.", "args": {}},
+    {"name": "cf_monthly_summary", "description": "Codeforces summary for a month (auto-tracked) -- problems solved by index (A/B/C/D...), rating delta, contests participated.", "args": {"month": "int, optional, defaults to current month", "year": "int, optional, defaults to current year"}},
+    {"name": "cf_upcoming_contest", "description": "Next upcoming Codeforces contest (Div 1/2/1+2/Educational) and time remaining until it starts.", "args": {}},
+    {"name": "check_in", "description": "Triggers the mood/energy check-in flow -- Jarvis asks about energy, mood, and soreness/injuries via voice, then speaks an adjusted plan for today. Use this whenever the user says things like 'check in', 'how am I doing', or asks about their energy/mood.", "args": {}},
+    {"name": "memory_summary", "description": "Speaks today's distilled memory summary (generated nightly at 11 PM from the past week's activity).", "args": {}},
+    {"name": "whats_my_plan", "description": "Reads today's plan adjustment (from the last mood check-in), whether today is a workout day, and the next upcoming CF contest.", "args": {}},
+    {"name": "last_time", "description": "Looks up the last time the user asked about or did something related to a topic, e.g. 'last time I asked about Spotify'.", "args": {"topic": "string, the topic/keyword to search for"}},
+    {"name": "easter_dont_leave", "description": "Triggers ONLY when the user says the exact phrase 'jarvis don't leave me buddy'. A scripted emotional sequence, ends by putting the PC to sleep.", "args": {}},
+    {"name": "easter_rumble", "description": "Triggers ONLY when the user says the exact phrase 'jarvis rumble'. Attack on Titan themed sequence.", "args": {}},
+    {"name": "easter_inevitable", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i am inevitable'. Thanos themed sequence that scans (not deletes) the Downloads folder.", "args": {}},
+    {"name": "easter_rick", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i used to be you'. Rick and Morty themed sequence.", "args": {}},
+    {"name": "easter_on_your_left", "description": "Triggers ONLY when the user says the exact phrase 'jarvis on your left'. Avengers Endgame themed sequence that opens several apps in order.", "args": {}},
+    {"name": "easter_evangelion", "description": "Triggers ONLY when the user says the exact phrase 'jarvis get in the robot'. Evangelion themed sequence.", "args": {}},
+    {"name": "easter_mandalorian", "description": "Triggers ONLY when the user says the exact phrase 'jarvis this is the way'. Mandalorian themed focus-session sequence.", "args": {}},
+    {"name": "easter_shirou", "description": "Triggers ONLY when the user says the exact phrase 'jarvis people die when they are killed'. Fate themed sequence, ends by putting the PC to sleep.", "args": {}},
+    {"name": "easter_deathnote_chip", "description": "Triggers ONLY when the user says the exact phrase about taking a potato chip and eating it. Death Note themed sequence.", "args": {}},
+    {"name": "easter_mha", "description": "Triggers ONLY when the user says the exact phrase 'jarvis go beyond'. My Hero Academia themed sequence.", "args": {}},
+    {"name": "easter_keikaku", "description": "Triggers ONLY when the user says the exact phrase 'jarvis just according to keikaku'. Death Note themed sequence reading today's real progress data.", "args": {}},
+    {"name": "easter_pokemon", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i choose you'. Pokemon themed sequence.", "args": {}},
     {"name": "set_timer", "description": "Sets a timer/reminder that pops up an alert when done.", "args": {"minutes": "number", "label": "string, optional"}},
     {"name": "media_play_pause", "description": "Toggles play/pause on the active media player (e.g. Spotify).", "args": {}},
     {"name": "media_next", "description": "Skips to the next track.", "args": {}},
@@ -943,11 +1399,22 @@ def run_function(name, args=None):
     if not func:
         return f"Unknown function: {name}"
     try:
-        return func(**args)
+        result = func(**args)
     except TypeError as e:
-        return f"Bad arguments for {name}: {e}"
+        result = f"Bad arguments for {name}: {e}"
     except Exception as e:
-        return f"Error running {name}: {e}"
+        result = f"Error running {name}: {e}"
+
+    # Event logging wraps the dispatcher -- every call gets recorded for
+    # the memory layer. Failure here must never break the actual
+    # dispatch, hence the blanket except.
+    try:
+        import jarvis_memory
+        jarvis_memory.log_event(name, args, result)
+    except Exception:
+        pass
+
+    return result
 
 
 def build_prompt_snippet():

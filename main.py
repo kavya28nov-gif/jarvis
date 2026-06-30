@@ -46,10 +46,14 @@ import jarvis_actions
 import voice_input
 import heartbeat_agent
 import tray_icon
+import cf_tracker
+import jarvis_memory
+import easter_eggs
 from orb_renderer import OrbRenderer
 
 SIZE = 360
 MAGIC_BG_HEX = "#010101"   # transparentcolor key — must not appear in the drawn orb
+_MAGIC_BG_RGB = (1, 1, 1)  # same key as an RGB tuple, for the brightness-preserving mask in _draw()
 FRAME_MS = 33              # ~30 fps animation
 
 OLLAMA_HOST = "http://localhost:11434"
@@ -85,6 +89,39 @@ def _wait_for_ollama(timeout=15):
         "start it with 'ollama serve' (and 'ollama pull hermes3' if needed)."
     )
     return False
+
+
+# ── easter-egg orb adapter ───────────────────────────────────────────────────────
+
+class OrbController:
+    """Thin adapter handed to easter_eggs.py handlers -- gives them
+    set_color/set_pulse_speed/set_brightness/freeze/restore without
+    exposing the rest of JarvisOrb. All mutations go through root.after()
+    since they touch Tk-rendered state from a non-Tk thread (easter eggs
+    run on their own background thread, same as _talk_flow)."""
+
+    def __init__(self, jarvis_orb):
+        self._orb = jarvis_orb
+
+    def set_color(self, r, g, b):
+        self._orb.root.after(0, lambda: self._orb._set_custom_color(r, g, b))
+
+    def set_pulse_speed(self, speed):
+        def _apply():
+            import orb_renderer
+            self._orb._pulse_speed_mult = speed
+            orb_renderer.set_custom_ring_speed(speed)
+        self._orb.root.after(0, _apply)
+
+    def set_brightness(self, level):
+        level = max(0.0, min(1.0, level))
+        self._orb.root.after(0, lambda: setattr(self._orb, "_brightness", level))
+
+    def freeze(self):
+        self._orb.root.after(0, lambda: setattr(self._orb, "_frozen", True))
+
+    def restore(self):
+        self._orb.root.after(0, self._orb._restore_from_easter_egg)
 
 
 # ── main class ────────────────────────────────────────────────────────────────
@@ -124,6 +161,16 @@ class JarvisOrb:
         self._sleep_mode = False
         self._hide_after_id = None
 
+        # Easter-egg orb controls -- additive on top of the existing
+        # state machine, never touches orb_renderer's projection/particle
+        # math. _frozen halts phase advancement; _brightness is a
+        # post-render scale applied in _draw(); _pulse_speed_mult scales
+        # the phase step while in the "custom" state.
+        self._frozen = False
+        self._brightness = 1.0
+        self._pulse_speed_mult = 1.0
+        self.orb_controller = OrbController(self)
+
         self._animate()
 
         self.canvas.bind("<ButtonPress-1>",   self._on_press)
@@ -140,21 +187,46 @@ class JarvisOrb:
 
         # autonomous heartbeat -- runs independent of mic/voice state
         self.heartbeat = heartbeat_agent.HeartbeatAgent(
-            on_state_change=self._on_heartbeat_state
+            on_state_change=self._on_heartbeat_state,
+            on_notify=self._on_heartbeat_notify,
+            on_checkin_trigger=self._on_checkin_trigger,
         )
         self.heartbeat.start()
+
+        # Codeforces daily submission/rating fetch -- separate cadence
+        # (24h) from the 30-min heartbeat, per the CF tracker spec.
+        cf_tracker.start_daily_fetch_thread()
 
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self):
         frame = self._renderer.render(self.state, self._phase)
+        if self._brightness != 1.0:
+            from PIL import ImageEnhance
+            import numpy as np
+            arr = np.array(frame)
+            # Darkening the whole frame shifts the untouched background
+            # pixels away from the exact magic color Tk uses for
+            # -transparentcolor (#010101) -- at low brightness the window
+            # stops being click-through/transparent and becomes a solid
+            # opaque square instead. Remember which pixels were exactly
+            # the background before enhancing, then force them back.
+            bg_mask = np.all(arr == np.array(_MAGIC_BG_RGB), axis=-1)
+            enhanced = np.array(ImageEnhance.Brightness(frame).enhance(self._brightness))
+            enhanced[bg_mask] = _MAGIC_BG_RGB
+            from PIL import Image as _Image
+            frame = _Image.fromarray(enhanced)
         self._photo = ImageTk.PhotoImage(frame)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
 
     def _animate(self):
-        step = 0.014 if self.state == "idle" else 0.032
-        self._phase = (self._phase + step) % 1.0
+        if not self._frozen:
+            if self.state == "custom":
+                step = 0.02 * self._pulse_speed_mult
+            else:
+                step = 0.014 if self.state == "idle" else 0.032
+            self._phase = (self._phase + step) % 1.0
         self._draw()
         self.root.after(FRAME_MS, self._animate)
 
@@ -181,6 +253,24 @@ class JarvisOrb:
         self._set_state("error")
         self.root.after(duration_ms, lambda: self._set_state("idle"))
 
+    # ── easter-egg orb controls ──────────────────────────────────────────────────
+
+    def _set_custom_color(self, r, g, b):
+        import orb_renderer
+        orb_renderer.set_override_color(r, g, b)
+        if self.state != "custom":
+            self._set_state("custom")  # only on first entry -- _set_state
+            # already handles deiconify; avoids resetting phase/restarting
+            # the ring rotation on every subsequent color change
+
+    def _restore_from_easter_egg(self):
+        import orb_renderer
+        self._frozen = False
+        self._brightness = 1.0
+        self._pulse_speed_mult = 1.0
+        orb_renderer.set_custom_ring_speed(1.0)
+        self._set_state("idle")
+
     # ── heartbeat / tray callbacks ───────────────────────────────────────────────
 
     def _on_heartbeat_state(self, state):
@@ -189,6 +279,40 @@ class JarvisOrb:
         fight over the same UI state."""
         if not self._busy:
             self.root.after(0, lambda: self._set_state(state))
+
+    def _on_heartbeat_notify(self, text):
+        """Speaks something out loud from the heartbeat thread (e.g. the
+        daily progress reminder) -- skipped while a voice interaction is
+        already in progress, same guard as _on_heartbeat_state."""
+        if self._busy:
+            return
+        self.root.after(0, lambda: self._set_state("speaking"))
+        self._speak(text)
+        self.root.after(0, lambda: self._set_state("idle"))
+
+    def _on_checkin_trigger(self):
+        """Called from the heartbeat thread (a proactive nudge or the
+        9 AM auto-trigger) to start the mood/energy check-in flow. Runs
+        on its own thread since it's a multi-turn blocking voice
+        interaction (3x speak+listen) -- can't run on the heartbeat
+        thread itself without stalling its 30-min tick loop, and can't
+        run on the Tk thread either since voice_input.listen() blocks on
+        the mic."""
+        if self._busy:
+            return
+        threading.Thread(target=self._run_mood_checkin, daemon=True).start()
+
+    def _run_mood_checkin(self):
+        self._busy = True
+        try:
+            self.root.after(0, lambda: self._set_state("speaking"))
+            result = jarvis_memory.run_mood_checkin(speak_fn=self._speak, listen_fn=voice_input.listen)
+            logger.info(result)
+        except Exception as e:
+            logger.error(f"[mood checkin error] {e}")
+        finally:
+            self.root.after(0, lambda: self._set_state("idle"))
+            self._busy = False
 
     def wake_up(self):
         self._sleep_mode = False
@@ -310,6 +434,52 @@ class JarvisOrb:
                 self._speak("Sorry sir, I couldn't figure out what to do with that.")
                 self.root.after(0, lambda: self._set_state("idle"))
                 return
+
+            # check_in needs a real multi-turn voice flow (3x speak+listen),
+            # not a single string return like every other action -- run it
+            # directly here (already off the Tk thread, already _busy)
+            # instead of through the normal run_function dispatch below.
+            checkin_actions = [a for a in actions if a.get("function") == "check_in"]
+            actions = [a for a in actions if a.get("function") != "check_in"]
+            if checkin_actions:
+                self.root.after(0, lambda: self._set_state("speaking"))
+                try:
+                    checkin_result = jarvis_memory.run_mood_checkin(
+                        speak_fn=self._speak, listen_fn=voice_input.listen
+                    )
+                    logger.info(checkin_result)
+                except Exception as e:
+                    logger.error(f"[checkin error] {e}")
+                if not actions:
+                    self.root.after(0, lambda: self._set_state("idle"))
+                    return
+
+            # easter eggs need live orb control + multi-line scripted TTS,
+            # not a single string return -- same interception pattern as
+            # check_in above. Only the first matched egg per command runs
+            # (firing two scripted sequences back-to-back makes no sense).
+            egg_actions = [a for a in actions if a.get("function") in easter_eggs.EASTER_EGG_HANDLERS]
+            actions = [a for a in actions if a.get("function") not in easter_eggs.EASTER_EGG_HANDLERS]
+            if egg_actions:
+                egg_name = egg_actions[0]["function"]
+                try:
+                    egg_result = easter_eggs.run_easter_egg(
+                        egg_name, speak_fn=self._speak, orb=self.orb_controller
+                    )
+                    logger.info(egg_result)
+                except Exception as e:
+                    logger.error(f"[easter egg error] {e}")
+                # Always do a full restore here, not just _set_state("idle")
+                # -- some eggs (easter_dont_leave) intentionally end with
+                # brightness faded to 0 and the orb frozen, right before
+                # sleep_pc(), without calling orb.restore() themselves.
+                # Once control returns here (the PC has woken back up),
+                # the visual overrides need to be reset or the orb stays
+                # frozen and black forever -- _set_state alone doesn't
+                # touch _brightness/_frozen/_pulse_speed_mult.
+                if not actions:
+                    self.root.after(0, self._restore_from_easter_egg)
+                    return
 
             # 3 — execute
             outcomes = []

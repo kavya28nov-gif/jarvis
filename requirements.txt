@@ -20,3 +20,4 @@ python-dotenv
 playwright
 ollama
 pystray
+matplotlib

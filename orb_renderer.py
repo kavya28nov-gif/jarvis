@@ -14,6 +14,25 @@ _BG    = (1, 1, 1)   # #010101 magic transparent — must match main.py
 _N_PTS = 180         # points per ring arc
 _N_PAR = 280         # particles
 
+# Settable override color for the "custom" state (easter eggs) -- kept
+# as plain module state, not threaded through render()'s signature, so
+# nothing about the existing per-state palette logic has to change.
+_override_color = (255, 180, 60)
+_custom_smul = 1.0
+
+
+def set_override_color(r, g, b):
+    global _override_color
+    _override_color = (r, g, b)
+
+
+def set_custom_ring_speed(smul):
+    """Ring-rotation speed multiplier for the "custom" state -- separate
+    from the phase-step pulse speed JarvisOrb controls (that one drives
+    color breathing; this one drives ring rotation)."""
+    global _custom_smul
+    _custom_smul = max(0.0, smul)
+
 
 def _safe(r, g, b):
     return (max(2, min(255, r)), max(2, min(255, g)), max(2, min(255, b)))
@@ -82,6 +101,15 @@ class OrbRenderer:
             core   = _safe(int(150+60*p), int(60+40*p), int(190+50*p))
             bright = _safe(int(190+40*p), int(100+50*p), int(230+25*p))
             glow   = _safe(int(120+50*p), int(30+30*p), int(160+60*p))
+        elif state == "custom":
+            # easter eggs -- breathes around whatever color was set via
+            # set_override_color(), same p-based pulsing as every other
+            # state, just driven by an external color instead of a fixed
+            # palette
+            r, g, b = _override_color
+            core   = _safe(r, g, b)
+            bright = _safe(min(255, r + 60), min(255, g + 60), min(255, b + 60))
+            glow   = _safe(int(r * 0.7), int(g * 0.7), int(b * 0.7))
         else:
             core = bright = glow = (110, 110, 110)
         return core, bright, glow
@@ -122,6 +150,8 @@ class OrbRenderer:
             smul = 1.0
         elif state == "background_processing":
             smul = 1.2
+        elif state == "custom":
+            smul = _custom_smul
         else:
             smul = 1.8
         core_c, bright_c, glow_c = self._palette(state, phase)

@@ -1,5 +1,6 @@
-# Secrets
+# Secrets / personal config
 .env
+jarvis_config.json
 
 # Python
 __pycache__/
