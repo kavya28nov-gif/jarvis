@@ -545,7 +545,7 @@ def start_phone_server(port=5000):
     ip = _local_ip()
     url = f"https://{ip}:{port}/?token={PHONE_SERVER_TOKEN}"
     print(f"\n{'='*46}")
-    print(f"  Jarvis Phone Remote → {url}")
+    print(f"  Jarvis Phone Remote -> {url}")
     print("  Open that URL in Chrome on your phone")
     print("  (token included -- don't share this link)")
     print(f"{'='*46}\n")
