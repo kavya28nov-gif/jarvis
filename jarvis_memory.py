@@ -209,6 +209,30 @@ def distill_memory():
     return True
 
 
+def get_fresh_mood(max_age_hours=18):
+    """(mood, energy) from the last check-in, or (None, None) if it's
+    older than max_age_hours -- stale mood shouldn't color today's
+    behavior."""
+    try:
+        ts = float(get_memory("last_mood_checkin_at") or 0)
+    except (TypeError, ValueError):
+        return (None, None)
+    if time.time() - ts > max_age_hours * 3600:
+        return (None, None)
+    return (get_memory("last_mood"), get_memory("last_energy"))
+
+
+def get_summary_for_date(date_iso):
+    """Distilled summary text for a date, or None. Used by the vault
+    journal mirror -- distilled output only, never raw events."""
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT summary_text FROM memory_summary WHERE date=?", (date_iso,)
+    ).fetchone()
+    conn.close()
+    return row["summary_text"] if row else None
+
+
 # ---------------------------------------------------------------------------
 # Context injection
 # ---------------------------------------------------------------------------

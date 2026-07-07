@@ -61,12 +61,23 @@ OLLAMA_HOST = "http://localhost:11434"
 # Under pythonw.exe there is no console, so route everything that used
 # to be a bare print() into a log file as well.
 LOG_PATH = os.path.join(os.path.dirname(__file__), "jarvis.log")
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
+    handlers=[
+        # 5 MB cap with one backup -- the log holds spoken commands and
+        # action results, so it shouldn't accumulate months of personal
+        # history on disk.
+        RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024,
+                            backupCount=1, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("jarvis.main")
+
+_tts_loop = asyncio.new_event_loop()
+threading.Thread(target=_tts_loop.run_forever, daemon=True, name="tts-event-loop").start()
 
 
 def _wait_for_ollama(timeout=15):
@@ -86,7 +97,7 @@ def _wait_for_ollama(timeout=15):
         time.sleep(1)
     logger.error(
         f"Ollama not reachable at {OLLAMA_HOST} after {timeout}s -- "
-        "start it with 'ollama serve' (and 'ollama pull hermes3' if needed)."
+        "start it with 'ollama serve' (and 'ollama pull qwen3:8b' if needed)."
     )
     return False
 
@@ -160,6 +171,10 @@ class JarvisOrb:
         self._busy = False
         self._sleep_mode = False
         self._hide_after_id = None
+        self._conversation_history = []
+        self._spotify_cooldown_until = 0.0
+        self._tts_playing = False
+        self._last_briefing_date = None
 
         # Easter-egg orb controls -- additive on top of the existing
         # state machine, never touches orb_renderer's projection/particle
@@ -170,6 +185,27 @@ class JarvisOrb:
         self._brightness = 1.0
         self._pulse_speed_mult = 1.0
         self.orb_controller = OrbController(self)
+
+        # Hand live TTS + orb control to action functions (rest_timer,
+        # contest_mode) -- they degrade to popups/no-ops when unset.
+        jarvis_actions.SPEAK_FN = self._speak
+        jarvis_actions.ORB_CONTROLLER = self.orb_controller
+
+        # TTS interruption -- set by the wake-word thread when "Hey
+        # Jarvis" is heard mid-speech, checked by _speak's playback loop.
+        self._tts_interrupt = False
+
+        # Music-reactive idle orb: a background thread polls the local
+        # audio output peak (pycaw, all on-device) into this attr; _draw
+        # modulates idle brightness with it.
+        self._audio_peak = 0.0
+        threading.Thread(target=self._audio_peak_loop, daemon=True).start()
+
+        # Idle orb tinted with the CF rank color, if a rating is known.
+        self._apply_rating_tint()
+
+        # One-time boot-up voice line.
+        threading.Thread(target=self._boot_sequence, daemon=True).start()
 
         self._animate()
 
@@ -197,11 +233,69 @@ class JarvisOrb:
         # (24h) from the 30-min heartbeat, per the CF tracker spec.
         cf_tracker.start_daily_fetch_thread()
 
+    # ── boot / ambient extras ─────────────────────────────────────────────────
+
+    def _boot_sequence(self):
+        """JARVIS-style startup line, once per launch."""
+        time.sleep(1.5)
+        if self._busy:
+            return
+        self.root.after(0, lambda: self._set_state("processing"))
+        self._speak("Systems online. All services operational, sir.")
+        self.root.after(0, lambda: self._set_state("idle"))
+
+    def _apply_rating_tint(self):
+        """Tints the idle orb with the CF rank color for the current
+        rating -- purely local DB read, silently keeps amber on failure."""
+        try:
+            rating = cf_tracker.get_current_rating()
+            if rating is None:
+                return
+            if rating < 1200:
+                tint = (170, 170, 170)   # newbie gray
+            elif rating < 1400:
+                tint = (110, 230, 110)   # pupil green
+            elif rating < 1600:
+                tint = (60, 210, 190)    # specialist cyan
+            elif rating < 1900:
+                tint = (120, 140, 255)   # expert blue
+            elif rating < 2100:
+                tint = (210, 110, 255)   # CM violet
+            elif rating < 2400:
+                tint = None              # master orange ≈ stock amber
+            else:
+                tint = (255, 80, 80)     # grandmaster red
+            import orb_renderer
+            orb_renderer.set_idle_tint(tint)
+        except Exception as e:
+            logger.error(f"[rating tint error] {e}")
+
+    def _audio_peak_loop(self):
+        """Polls the system audio output level ~10x/sec so the idle orb
+        can pulse with whatever's playing. COM needs initializing on this
+        thread specifically."""
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        while True:
+            try:
+                self._audio_peak = jarvis_actions.get_audio_peak()
+            except Exception:
+                self._audio_peak = 0.0
+            time.sleep(0.1)
+
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self):
         frame = self._renderer.render(self.state, self._phase)
-        if self._brightness != 1.0:
+        brightness = self._brightness
+        # Music-reactive idle pulse: breathe between 80% and full
+        # brightness with the live audio output level.
+        if self.state == "idle" and not self._frozen and self._audio_peak > 0.04:
+            brightness = min(1.0, brightness * (0.8 + 0.5 * self._audio_peak))
+        if brightness != 1.0:
             from PIL import ImageEnhance
             import numpy as np
             arr = np.array(frame)
@@ -212,7 +306,7 @@ class JarvisOrb:
             # opaque square instead. Remember which pixels were exactly
             # the background before enhancing, then force them back.
             bg_mask = np.all(arr == np.array(_MAGIC_BG_RGB), axis=-1)
-            enhanced = np.array(ImageEnhance.Brightness(frame).enhance(self._brightness))
+            enhanced = np.array(ImageEnhance.Brightness(frame).enhance(brightness))
             enhanced[bg_mask] = _MAGIC_BG_RGB
             from PIL import Image as _Image
             frame = _Image.fromarray(enhanced)
@@ -275,9 +369,10 @@ class JarvisOrb:
 
     def _on_heartbeat_state(self, state):
         """Bridges heartbeat_agent's background thread into the Tk thread.
-        Skipped while a voice interaction owns the orb, so the two never
-        fight over the same UI state."""
-        if not self._busy:
+        Skipped while a voice interaction owns the orb, and while the orb
+        is in "custom" (easter egg / demon-mode eyes) -- resetting to
+        idle there would auto-hide the window mid-sequence."""
+        if not self._busy and self.state != "custom":
             self.root.after(0, lambda: self._set_state(state))
 
     def _on_heartbeat_notify(self, text):
@@ -365,6 +460,16 @@ class JarvisOrb:
                                  blocksize=CHUNK) as stream:
                 while self._wake_active:
                     audio, _ = stream.read(CHUNK)
+                    # While Jarvis is speaking, "Hey Jarvis" acts as an
+                    # interrupt (stops TTS playback) instead of starting a
+                    # new interaction.
+                    if self._tts_playing:
+                        score = max(oww.predict(audio.flatten()).values(), default=0)
+                        if score > 0.5:
+                            logger.info("Interrupt — stopping TTS.")
+                            self._tts_interrupt = True
+                            oww.reset()
+                        continue
                     if self._busy:
                         oww.reset()
                         continue
@@ -382,14 +487,51 @@ class JarvisOrb:
             logger.error(f"[wake word error] {e}")
 
     def _trigger_from_wake_word(self):
+        if time.time() < self._spotify_cooldown_until:
+            return
         if self.state == "idle" and not self._busy:
             threading.Thread(target=self._talk_flow, daemon=True).start()
 
     # ── voice pipeline ────────────────────────────────────────────────────────
 
+    def _daily_briefing(self):
+        """Short JARVIS-style briefing on the first interaction of each
+        day -- greeting, today's lifts, and the next CF contest. Uses
+        only data Jarvis already tracks locally; each piece degrades
+        silently if unavailable."""
+        import datetime
+        today = datetime.date.today()
+        if self._last_briefing_date == today:
+            return
+        self._last_briefing_date = today
+
+        hour = datetime.datetime.now().hour
+        greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+        parts = [f"{greeting} sir. First session of the day."]
+        try:
+            parts.append(jarvis_actions.todays_workout())
+        except Exception:
+            pass
+        try:
+            parts.append(cf_tracker.cf_upcoming_contest())
+        except Exception:
+            pass
+        try:
+            streaks = jarvis_actions.show_streaks()
+            if "streak:" in streaks:  # only brag when a streak exists
+                parts.append(streaks)
+        except Exception:
+            pass
+
+        self.root.after(0, lambda: self._set_state("speaking"))
+        for part in parts:
+            self._speak(part)
+
     def _talk_flow(self):
         self._busy = True
         try:
+            self._daily_briefing()
+
             # 1 — listen
             self.root.after(0, lambda: self._set_state("listening"))
             try:
@@ -404,113 +546,157 @@ class JarvisOrb:
                 self.root.after(0, lambda: self._set_state("idle"))
                 return
 
-            logger.info(f"> {text}")
+            # Follow-up mode: after answering, the mic stays open ~4s for
+            # another command without re-saying "Hey Jarvis". Up to 3
+            # follow-ups per session; music playback and easter eggs end
+            # the session (the mic would just hear the song / the egg owns
+            # the orb).
+            MAX_FOLLOW_UPS = 3
+            for turn in range(1 + MAX_FOLLOW_UPS):
+                logger.info(f"> {text}")
 
-            # easter eggs
-            clean = text.lower().strip()
-            if "who is a good boy" in clean:
-                self.root.after(0, lambda: self._set_state("speaking"))
-                self._speak("ME SIR MEEE!")
-                self.root.after(0, lambda: self._set_state("idle"))
-                return
-            if "are you there" in clean:
-                self.root.after(0, lambda: self._set_state("speaking"))
-                self._speak("For you sir, always.")
-                self.root.after(0, lambda: self._set_state("idle"))
-                return
+                # inline one-liners that don't need the manifest/LLM
+                clean = text.lower().strip()
+                if "who is a good boy" in clean:
+                    self.root.after(0, lambda: self._set_state("speaking"))
+                    self._speak("ME SIR MEEE!")
+                    break
+                if "are you there" in clean:
+                    self.root.after(0, lambda: self._set_state("speaking"))
+                    self._speak("For you sir, always.")
+                    break
 
-            # 2 — parse
-            self.root.after(0, lambda: self._set_state("processing"))
-            try:
-                result = intent_parser.parse_command(text)
-            except Exception as e:
-                logger.error(f"[parse error] {e}")
-                self.root.after(0, self._show_error)
-                return
-
-            actions = result.get("actions", [])
-            if not actions:
-                self.root.after(0, lambda: self._set_state("speaking"))
-                self._speak("Sorry sir, I couldn't figure out what to do with that.")
-                self.root.after(0, lambda: self._set_state("idle"))
-                return
-
-            # check_in needs a real multi-turn voice flow (3x speak+listen),
-            # not a single string return like every other action -- run it
-            # directly here (already off the Tk thread, already _busy)
-            # instead of through the normal run_function dispatch below.
-            checkin_actions = [a for a in actions if a.get("function") == "check_in"]
-            actions = [a for a in actions if a.get("function") != "check_in"]
-            if checkin_actions:
-                self.root.after(0, lambda: self._set_state("speaking"))
+                # 2 — parse (pass last 3 turns so Jarvis understands "play
+                # that again", "same artist", "cancel that", etc.)
+                self.root.after(0, lambda: self._set_state("processing"))
                 try:
-                    checkin_result = jarvis_memory.run_mood_checkin(
-                        speak_fn=self._speak, listen_fn=voice_input.listen
-                    )
-                    logger.info(checkin_result)
+                    result = intent_parser.parse_command(text, history=self._conversation_history)
                 except Exception as e:
-                    logger.error(f"[checkin error] {e}")
-                if not actions:
-                    self.root.after(0, lambda: self._set_state("idle"))
+                    logger.error(f"[parse error] {e}")
+                    self.root.after(0, self._show_error)
                     return
 
-            # easter eggs need live orb control + multi-line scripted TTS,
-            # not a single string return -- same interception pattern as
-            # check_in above. Only the first matched egg per command runs
-            # (firing two scripted sequences back-to-back makes no sense).
-            egg_actions = [a for a in actions if a.get("function") in easter_eggs.EASTER_EGG_HANDLERS]
-            actions = [a for a in actions if a.get("function") not in easter_eggs.EASTER_EGG_HANDLERS]
-            if egg_actions:
-                egg_name = egg_actions[0]["function"]
-                try:
-                    egg_result = easter_eggs.run_easter_egg(
-                        egg_name, speak_fn=self._speak, orb=self.orb_controller
-                    )
-                    logger.info(egg_result)
-                except Exception as e:
-                    logger.error(f"[easter egg error] {e}")
-                # Always do a full restore here, not just _set_state("idle")
-                # -- some eggs (easter_dont_leave) intentionally end with
-                # brightness faded to 0 and the orb frozen, right before
-                # sleep_pc(), without calling orb.restore() themselves.
-                # Once control returns here (the PC has woken back up),
-                # the visual overrides need to be reset or the orb stays
-                # frozen and black forever -- _set_state alone doesn't
-                # touch _brightness/_frozen/_pulse_speed_mult.
+                actions = result.get("actions", [])
                 if not actions:
+                    self.root.after(0, lambda: self._set_state("speaking"))
+                    self._speak("Sorry sir, I couldn't figure out what to do with that.")
+                    break
+
+                # 3 — dispatch: single pass, branching on action type.
+                # check_in and easter eggs need live TTS/orb -- intercepted
+                # here instead of going through run_function. Only the first
+                # matched egg runs.
+                outcomes = []
+                ran_egg = False
+                played_spotify = False
+                spotify_fns = {"play_spotify_search", "play_spotify_playlist"}
+                # Irreversible actions require a spoken confirmation --
+                # guards against mishearings ("shut down" vs "sit down").
+                destructive_fns = {"shutdown_pc", "sleep_pc", "kill_process"}
+                confirm_words = ("yes", "yeah", "yep", "sure", "do it", "confirm", "go ahead")
+
+                for action in actions:
+                    name = action.get("function")
+                    args = action.get("args", {})
+
+                    if name in destructive_fns:
+                        nice = name.replace("_", " ")
+                        self.root.after(0, lambda: self._set_state("speaking"))
+                        self._speak(f"About to {nice}. Are you sure, sir?")
+                        self.root.after(0, lambda: self._set_state("listening"))
+                        reply = None
+                        try:
+                            reply = voice_input.listen(max_wait=5)
+                        except Exception as e:
+                            logger.error(f"[confirm listen error] {e}")
+                        if not reply or not any(w in reply.lower() for w in confirm_words):
+                            outcomes.append(f"Cancelled {nice}.")
+                            continue
+
+                    if name == "chat":
+                        # conversational mode -- the parser answered the
+                        # question itself; just speak it (via outcomes)
+                        reply = (args.get("response") or "").strip()
+                        if reply:
+                            outcomes.append(reply)
+                        continue
+
+                    if name == "check_in":
+                        self.root.after(0, lambda: self._set_state("speaking"))
+                        try:
+                            logger.info(jarvis_memory.run_mood_checkin(
+                                speak_fn=self._speak, listen_fn=voice_input.listen
+                            ))
+                        except Exception as e:
+                            logger.error(f"[checkin error] {e}")
+
+                    elif name in easter_eggs.EASTER_EGG_HANDLERS:
+                        if ran_egg:
+                            continue
+                        ran_egg = True
+                        try:
+                            logger.info(easter_eggs.run_easter_egg(
+                                name, speak_fn=self._speak, orb=self.orb_controller
+                            ))
+                        except Exception as e:
+                            logger.error(f"[easter egg error] {e}")
+
+                    else:
+                        try:
+                            outcome = jarvis_actions.run_function(name, args)
+                            logger.info(outcome)
+                            outcomes.append(outcome)
+                            if name in spotify_fns:
+                                played_spotify = True
+                        except Exception as e:
+                            logger.error(f"[action error] {e}")
+                            outcomes.append(f"Error: {e}")
+
+                # update rolling conversation history (capped at 10 turns)
+                # so the next command has context for pronouns / follow-ups
+                self._conversation_history.append({"user": text, "actions": actions})
+                if len(self._conversation_history) > 10:
+                    self._conversation_history.pop(0)
+
+                # some eggs (easter_dont_leave) end with the orb frozen/dark
+                # and never call orb.restore() themselves, so always do a
+                # full restore when returning from an egg sequence
+                if ran_egg:
                     self.root.after(0, self._restore_from_easter_egg)
-                    return
+                    if not outcomes:
+                        return
 
-            # 3 — execute
-            outcomes = []
-            for action in actions:
-                name = action.get("function")
-                args = action.get("args", {})
+                # 4 — speak outcomes
+                self.root.after(0, lambda: self._set_state("speaking"))
+                for outcome in outcomes:
+                    if not outcome:
+                        continue
+                    if outcome.lower().startswith("error"):
+                        self._speak(f"Sorry sir, {outcome}")
+                    else:
+                        self._speak(outcome)
+
+                if played_spotify:
+                    # set a cooldown timestamp instead of blocking with
+                    # sleep(6) -- _trigger_from_wake_word checks this so
+                    # the mic won't pick up the song
+                    self._spotify_cooldown_until = time.time() + 6
+                    break
+                if ran_egg or turn >= MAX_FOLLOW_UPS:
+                    break
+
+                # follow-up window: brief re-listen, silence just ends the
+                # session without an error state
+                self.root.after(0, lambda: self._set_state("listening"))
                 try:
-                    outcome = jarvis_actions.run_function(name, args)
-                    logger.info(outcome)
-                    outcomes.append(outcome)
+                    text = voice_input.listen(max_wait=4)
                 except Exception as e:
-                    logger.error(f"[action error] {e}")
-                    outcomes.append(f"Error: {e}")
-
-            # 4 — speak
-            self.root.after(0, lambda: self._set_state("speaking"))
-            for outcome in outcomes:
-                if not outcome:
-                    continue
-                if outcome.lower().startswith("error"):
-                    self._speak(f"Sorry sir, {outcome}")
-                else:
-                    self._speak(outcome)
+                    logger.error(f"[follow-up listen error] {e}")
+                    text = None
+                if not text:
+                    break
 
             self.root.after(0, lambda: self._set_state("idle"))
-
-            # If we just started music, hold busy for 6s so the mic doesn't
-            # pick up the song and re-trigger the same command.
-            spotify_fns = {"play_spotify_search", "play_spotify_playlist"}
-            if any(a.get("function") in spotify_fns for a in actions):
-                time.sleep(6)
 
         finally:
             self._busy = False
@@ -518,32 +704,72 @@ class JarvisOrb:
     def _speak(self, text):
         try:
             import edge_tts
+            import datetime as _dt
+
+            voice = jarvis_actions.VOICE_NAME
+            # Mood-aware delivery: if the last check-in (fresh, <18h)
+            # said rough/low, Jarvis speaks a touch slower and softer --
+            # tone adapts, words don't.
+            mood_rate = 0
+            mood_vol_scale = 1.0
+            try:
+                mood, energy = jarvis_memory.get_fresh_mood()
+                if energy == "low":
+                    mood_rate -= 8
+                if mood == "rough":
+                    mood_rate -= 5
+                    mood_vol_scale = 0.85
+            except Exception:
+                pass
+            rate = f"{max(-50, min(50, jarvis_actions.VOICE_RATE + mood_rate)):+d}%"
 
             async def _synthesize():
-                communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
+                communicate = edge_tts.Communicate(text, voice=voice, rate=rate)
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     tmp = f.name
                 await communicate.save(tmp)
                 return tmp
 
-            # Run in a fresh thread -- Playwright's sync API (used by
-            # send_whatsapp) leaves this thread's asyncio state in a way
-            # that makes a later asyncio.run() here raise "cannot be
-            # called from a running event loop", even though nothing is
-            # actually running. A brand-new thread has clean asyncio state.
-            tmp_holder = {}
-            def _run_synth():
-                tmp_holder["path"] = asyncio.run(_synthesize())
-            t = threading.Thread(target=_run_synth)
-            t.start()
-            t.join()
-            tmp = tmp_holder["path"]
+            # Submit to the persistent TTS event loop instead of spawning a
+            # fresh thread + asyncio.run() each call. The dedicated loop
+            # avoids the "cannot be called from a running event loop" error
+            # that Playwright's sync API left behind on the caller's thread.
+            future = asyncio.run_coroutine_threadsafe(_synthesize(), _tts_loop)
+            tmp = future.result(timeout=30)
 
-            # Play MP3 via Windows MCI — no extra packages needed
-            mci = ctypes.windll.winmm.mciSendStringW
-            mci(f'open "{tmp}" type mpegvideo alias jarvis_tts', None, 0, None)
-            mci('play jarvis_tts wait', None, 0, None)
-            mci('close jarvis_tts', None, 0, None)
+            # Whisper mode: manual toggle OR quiet hours (11 PM - 7 AM).
+            hour = _dt.datetime.now().hour
+            quiet = jarvis_actions.WHISPER_MODE or hour >= 23 or hour < 7
+
+            # Play MP3 via Windows MCI — no extra packages needed. Played
+            # non-blocking with a poll loop so a "Hey Jarvis" mid-speech
+            # (which sets _tts_interrupt) can cut playback short.
+            # Other apps' audio (music, video) is ducked to 25% for the
+            # duration so Jarvis talks over it, not against it.
+            self._tts_playing = True
+            self._tts_interrupt = False
+            jarvis_actions.duck_other_audio(True)
+            try:
+                mci = ctypes.windll.winmm.mciSendStringW
+                mci(f'open "{tmp}" type mpegvideo alias jarvis_tts', None, 0, None)
+                base_vol = 300 if quiet else 1000
+                mci(f'setaudio jarvis_tts volume to {int(base_vol * mood_vol_scale)}', None, 0, None)
+                mci('play jarvis_tts', None, 0, None)
+                status_buf = ctypes.create_unicode_buffer(64)
+                while True:
+                    ctypes.windll.winmm.mciSendStringW(
+                        'status jarvis_tts mode', status_buf, 64, None)
+                    if status_buf.value != "playing":
+                        break
+                    if self._tts_interrupt:
+                        mci('stop jarvis_tts', None, 0, None)
+                        break
+                    time.sleep(0.05)
+                mci('close jarvis_tts', None, 0, None)
+            finally:
+                self._tts_playing = False
+                self._tts_interrupt = False
+                jarvis_actions.duck_other_audio(False)
             os.unlink(tmp)
 
         except Exception as e:

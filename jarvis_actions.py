@@ -7,6 +7,7 @@ import datetime
 import base64
 import json
 import threading
+import time
 import shutil
 import urllib.parse
 
@@ -34,7 +35,7 @@ load_dotenv()
 # pattern as every other manifest entry in this file.
 from cf_tracker import (
     cf_rating, cf_today, cf_last_contest, cf_monthly_summary, cf_upcoming_contest,
-    build_cf_monthly_payload,
+    cf_upsolve, cf_drill, build_cf_monthly_payload,
 )
 from jarvis_memory import check_in, memory_summary, whats_my_plan, last_time
 from easter_eggs import (
@@ -47,6 +48,43 @@ from easter_eggs import (
 # ---------------------------------------------------------------------------
 # Config you should edit
 # ---------------------------------------------------------------------------
+# Personal entries (contacts, project paths, extra sites/folders) live in
+# jarvis_config.json -- it's gitignored, so private data never risks being
+# committed. The dicts below are just defaults; matching keys in the JSON
+# ("project_paths", "sites", "whatsapp_contacts", "folder_shortcuts",
+# "whatsapp_default_country_code") are merged over them at import time.
+
+# ---------------------------------------------------------------------------
+# Hooks injected by main.py -- give action functions optional access to
+# live TTS and the orb without a circular import. Both stay None when
+# this module is used headless (phone server, tests), and every user of
+# them degrades gracefully in that case.
+# ---------------------------------------------------------------------------
+
+SPEAK_FN = None         # set to JarvisOrb._speak
+ORB_CONTROLLER = None   # set to JarvisOrb.orb_controller
+
+# Voice output settings, read by main._speak on every utterance.
+WHISPER_MODE = False                # manual quiet-mode toggle
+VOICE_RATE = 0                      # edge-tts rate offset in percent (-50..50)
+VOICE_NAME = "en-US-AriaNeural"
+
+# Last dispatched action -- shown on the phone remote's status card.
+# Private functions get their result masked before landing here.
+LAST_ACTION = {"name": None, "result": None, "time": None}
+
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "jarvis_config.json")
+
+
+def _load_user_config():
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_USER_CONFIG = _load_user_config()
 
 PROJECT_PATHS = {
     # "jarvis": r"C:\Users\YourName\Projects\jarvis",
@@ -98,6 +136,317 @@ FOLDER_SHORTCUTS = {
     "documents": os.path.expanduser("~/Documents"),
     "pictures": os.path.expanduser("~/Pictures"),
 }
+
+# ---------------------------------------------------------------------------
+# Obsidian vault integration (Stage 1: voice capture)
+# ---------------------------------------------------------------------------
+
+def _vault_root():
+    """Configured vault as a Path, or None if unset/missing -- callers
+    speak a graceful 'not configured' instead of crashing."""
+    from pathlib import Path
+    p = _USER_CONFIG.get("vault_path")
+    if not p:
+        return None
+    root = Path(p)
+    return root if root.is_dir() else None
+
+
+def _vault_subdir(kind):
+    """kind: 'inbox' | 'journal'. Creates the folder on first use --
+    these are Jarvis-owned; wiki/ is never touched."""
+    root = _vault_root()
+    if root is None:
+        return None
+    sub = root / _USER_CONFIG.get(f"vault_{kind}", kind)
+    sub.mkdir(parents=True, exist_ok=True)
+    return sub
+
+
+_CAPTURE_ACKS = ["Noted.", "Captured.", "In the inbox.", "Got it, sir."]
+
+
+def capture_note(text, todo=False, source="voice"):
+    """Appends a spoken note to the vault's daily inbox file
+    (<vault>/inbox/YYYY-MM-DD.md), creating it with frontmatter on the
+    first capture of the day. todo=True writes it as an unchecked
+    checkbox task instead, completable later via complete_task. Note
+    content is NEVER logged to the event DB -- capture_note is in
+    PRIVATE_FUNCTIONS."""
+    import random
+    inbox = _vault_subdir("inbox")
+    if inbox is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    text = (text or "").strip()
+    if not text:
+        return "Nothing to capture, sir."
+    today = datetime.date.today().isoformat()
+    path = inbox / f"{today}.md"
+    prefix = "- [ ] " if todo else "- "
+    line = f"{prefix}**{datetime.datetime.now().strftime('%H:%M')}** ({source}) {text}\n"
+    if not path.exists():
+        path.write_text(f"---\ndate: {today}\ntype: voice-inbox\n---\n\n{line}",
+                        encoding="utf-8")
+    else:
+        # guard: if the file somehow lost its trailing newline (manual
+        # edit, crash mid-write), don't glue onto the previous entry
+        needs_nl = not path.read_text(encoding="utf-8").endswith("\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(("\n" if needs_nl else "") + line)
+    return random.choice(_CAPTURE_ACKS)
+
+
+def dictate_to_note(max_seconds=180):
+    """Long-form dictation into a vault DRAFT note (instead of typing
+    into the focused window like dictation_mode). Each utterance becomes
+    a paragraph; 'stop dictation' ends it. The librarian structures the
+    draft on its next ingest. Content never reaches the event DB."""
+    import voice_input
+    inbox = _vault_subdir("inbox")
+    if inbox is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    if SPEAK_FN:
+        SPEAK_FN("Dictating to a draft. Speak in passages; say stop dictation when done.")
+    stamp = datetime.datetime.now()
+    paras = []
+    deadline = time.time() + float(max_seconds)
+    while time.time() < deadline:
+        try:
+            text = voice_input.listen(max_wait=8)
+        except Exception:
+            break
+        if not text:
+            continue
+        if text.lower().strip().rstrip(".!") in ("stop", "stop dictation", "end dictation"):
+            break
+        paras.append(text)
+    if not paras:
+        return "Nothing dictated, sir -- no draft created."
+    path = inbox / f"draft-{stamp.strftime('%Y-%m-%d-%H%M')}.md"
+    content = (
+        f"---\ndate: {stamp.date().isoformat()}\ntype: draft\nstatus: raw\n---\n\n"
+        f"# Draft — {stamp.strftime('%Y-%m-%d %H:%M')}\n\n"
+        + "\n\n".join(paras) + "\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return f"Draft saved -- {len(paras)} passage(s). The librarian can shape it later."
+
+
+def capture_screen_note(comment=""):
+    """'Note what I'm looking at': AI description of the current screen
+    plus the user's spoken comment, captured together as one inbox note.
+    Uses the same Groq vision surface as describe_screen; screenshots
+    are deleted immediately, and the note content stays redacted from
+    the event DB."""
+    if _vault_root() is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    desc = describe_screen()
+    text = f"[screen] {desc}"
+    comment = (comment or "").strip()
+    if comment:
+        text += f" | my comment: {comment}"
+    capture_note(text, source="screen")
+    return "Screen noted, sir."
+
+
+# ── vault tasks: list / complete checkbox items in Jarvis-owned files ───────
+
+def _task_files():
+    """Files Jarvis may edit checkboxes in: inbox dailies + CF debriefs.
+    NOT the daily journal files (the heartbeat rewrites those nightly,
+    which would silently undo a checkbox) and never wiki/."""
+    import re
+    files = []
+    inbox = _vault_subdir("inbox")
+    journal = _vault_subdir("journal")
+    if inbox:
+        # only the YYYY-MM-DD dailies Jarvis creates -- other inbox files
+        # (dropped-in documents like the roadmap) aren't Jarvis-owned and
+        # their checkboxes belong to the librarian/user
+        files += sorted(
+            (p for p in inbox.glob("*.md") if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.md", p.name)),
+            reverse=True)
+    if journal:
+        files += sorted(journal.glob("cf-*-debrief.md"), reverse=True)
+    return files
+
+
+_UNCHECKED_RE = None  # compiled lazily
+
+
+def _iter_open_tasks():
+    import re
+    global _UNCHECKED_RE
+    if _UNCHECKED_RE is None:
+        _UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.+)$")
+    for path in _task_files():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for i, ln in enumerate(lines):
+            m = _UNCHECKED_RE.match(ln)
+            if m:
+                yield path, i, m.group(1).strip()
+
+
+def _task_display(raw):
+    """Strips the '**HH:MM** (voice) ' capture prefix for speech."""
+    import re
+    return re.sub(r"^\*\*\d{2}:\d{2}\*\* \((?:voice|migrated|phone|screen)\) ", "", raw)
+
+
+def list_tasks():
+    """Speaks the open (unchecked) tasks from the vault inbox and CF
+    debriefs."""
+    if _vault_root() is None:
+        return "Vault not configured, sir."
+    tasks = [_task_display(t) for _, _, t in _iter_open_tasks()]
+    if not tasks:
+        return "No open tasks, sir. Suspiciously productive."
+    listed = tasks[:8]
+    more = f" ...and {len(tasks) - 8} more." if len(tasks) > 8 else ""
+    return f"{len(tasks)} open task(s): " + "; ".join(listed) + "." + more
+
+
+def complete_task(name):
+    """Marks the best-matching open checkbox task as done ([x] plus a
+    completion date). Only edits Jarvis-owned files."""
+    if _vault_root() is None:
+        return "Vault not configured, sir."
+    name_tokens = set((name or "").lower().split())
+    if not name_tokens:
+        return "Which task, sir?"
+
+    best = None  # (score, path, line_idx, text)
+    for path, i, text in _iter_open_tasks():
+        text_l = _task_display(text).lower()
+        overlap = sum(1 for t in name_tokens if t in text_l)
+        score = overlap / len(name_tokens)
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, path, i, text)
+
+    if best is None or best[0] < 0.5:
+        return f"No open task matching '{name}', sir."
+    _, path, i, text = best
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    today = datetime.date.today().isoformat()
+    lines[i] = lines[i].replace("- [ ]", "- [x]", 1).rstrip("\n") + f" ✅ {today}\n"
+    path.write_text("".join(lines), encoding="utf-8")
+    return f"Done: {_task_display(text)}. Marked complete."
+
+
+# ── Stage 3: ask_brain -- voice retrieval over the vault ────────────────────
+
+_ASK_BRAIN_PROMPT = (
+    "You are JARVIS answering from the user's personal Obsidian notes. "
+    "Answer ONLY from the provided notes -- never from general knowledge. "
+    "If the notes don't contain the answer, say exactly: "
+    "\"I don't have that in your notes.\" "
+    "Under 60 words, plain spoken text, no markdown, dry JARVIS tone, "
+    "'sir' optional. /no_think"
+)
+
+
+def _retrieve_vault_chunks(query, top_k=5):
+    """Tries the vault's own retrieval pipeline first (scripts/retrieve.py
+    -- exits 10 unprovisioned, and its bm25 sibling hard-imports fcntl so
+    it currently can't run on Windows), then falls back to the local
+    pure-Python BM25 searcher. Returns (chunks, source_label)."""
+    import sys
+    root = _vault_root()
+    script = root / _USER_CONFIG.get("vault_retrieve_script", "scripts/retrieve.py")
+    if script.is_file():
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script), query, "--top", str(top_k), "--no-rerank"],
+                capture_output=True, text=True, timeout=15, cwd=str(root),
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                chunks = [
+                    {"page_path": c.get("page_path", "?"), "snippet": c.get("snippet", "")}
+                    for c in data.get("candidates", []) if c.get("snippet")
+                ]
+                if chunks:
+                    return chunks, "vault-retrieve"
+        except Exception as e:
+            print(f"[ask_brain] vault retrieve.py failed ({e}) -- using local fallback")
+    import vault_search
+    return vault_search.search(root, query, top_k=top_k), "local-bm25-fallback"
+
+
+def ask_brain(query):
+    """Answers a question from the user's Obsidian notes: retrieve top
+    chunks (vault pipeline or local BM25), then ask local Ollama qwen3:8b
+    with a strict only-from-notes prompt. Speaks an acknowledgment first
+    since retrieval + local inference can take a while; the rest runs on
+    this dispatch thread (already off the UI thread, _busy held), so the
+    answer flows back as the normal spoken outcome."""
+    import re as _re
+    root = _vault_root()
+    if root is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    if SPEAK_FN:
+        try:
+            SPEAK_FN("Checking your notes. Give me a moment.")
+        except Exception:
+            pass
+
+    try:
+        # 4 chunks max -- prompt prefill dominates latency on CPU-only
+        # Ollama (measured ~64s at 1000 prompt tokens on this machine)
+        chunks, source = _retrieve_vault_chunks(query, top_k=4)
+        print(f"[ask_brain] retrieval via {source}: {len(chunks)} chunk(s)")
+    except Exception as e:
+        print(f"[ask_brain] retrieval error: {e}")
+        return "I couldn't search your notes, sir -- check the log."
+    if not chunks:
+        return "I don't have that in your notes."
+
+    context = "\n\n".join(
+        f"[note: {c['page_path']}]\n{c['snippet'][:500]}" for c in chunks
+    )
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/chat",
+            json={
+                "model": "qwen3:8b",
+                "stream": False,
+                # think:false is essential -- without it qwen3 burns the
+                # whole num_predict budget on hidden reasoning and returns
+                # an empty answer (and takes 10x longer)
+                "think": False,
+                "messages": [
+                    {"role": "system", "content": _ASK_BRAIN_PROMPT},
+                    {"role": "user",
+                     "content": f"Notes:\n{context}\n\nQuestion: {query}"},
+                ],
+                # num_predict caps runaway generations; keep_alive keeps
+                # the model resident so follow-up questions skip the
+                # ~30s cold load
+                "options": {"temperature": 0.3, "num_predict": 150},
+                "keep_alive": "30m",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["message"]["content"]
+        answer = _re.sub(r"<think>.*?</think>", "", answer, flags=_re.S).strip()
+        return answer or "I don't have that in your notes."
+    except Exception as e:
+        print(f"[ask_brain] ollama error: {e}")
+        return "I couldn't reach the local model, sir -- is Ollama running?"
+
+
+# Merge user overrides from jarvis_config.json over the defaults above.
+PROJECT_PATHS.update(_USER_CONFIG.get("project_paths", {}))
+SITES.update(_USER_CONFIG.get("sites", {}))
+WHATSAPP_CONTACTS.update(_USER_CONFIG.get("whatsapp_contacts", {}))
+FOLDER_SHORTCUTS.update(_USER_CONFIG.get("folder_shortcuts", {}))
+WHATSAPP_DEFAULT_COUNTRY_CODE = _USER_CONFIG.get(
+    "whatsapp_default_country_code", WHATSAPP_DEFAULT_COUNTRY_CODE
+)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +510,309 @@ def set_brightness(level=70):
     return f"Brightness set to {level}%."
 
 
+_audio_meter_cache = None
+
+
+def get_audio_peak():
+    """Current system audio output peak, 0.0-1.0 -- read locally from the
+    Windows audio endpoint (pycaw), nothing leaves the machine. Used to
+    make the idle orb pulse with music. Returns 0.0 on any failure."""
+    global _audio_meter_cache
+    try:
+        from pycaw.pycaw import IAudioMeterInformation
+        with _volume_iface_lock:
+            if _audio_meter_cache is None:
+                devices = AudioUtilities.GetSpeakers()
+                dev = getattr(devices, "_dev", devices)
+                interface = dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
+                _audio_meter_cache = cast(interface, POINTER(IAudioMeterInformation))
+        return float(_audio_meter_cache.GetPeakValue())
+    except Exception:
+        return 0.0
+
+
+_ducked_sessions = {}
+
+
+def duck_other_audio(duck=True, level=0.25):
+    """Lowers every other app's volume (Spotify, browser, games) to
+    `level` while Jarvis speaks, then restores -- so Jarvis talks OVER
+    the music instead of competing with it. Per-app session volumes via
+    pycaw, all local. Fails silently: ducking is a nicety, never worth
+    breaking speech over."""
+    global _ducked_sessions
+    try:
+        from pycaw.pycaw import AudioUtilities
+        sessions = AudioUtilities.GetAllSessions()
+        if duck:
+            _ducked_sessions = {}
+            for s in sessions:
+                if s.Process is None:
+                    continue
+                vol = s.SimpleAudioVolume
+                cur = vol.GetMasterVolume()
+                if cur > level:
+                    _ducked_sessions[s.Process.pid] = cur
+                    vol.SetMasterVolume(level, None)
+        else:
+            for s in sessions:
+                if s.Process and s.Process.pid in _ducked_sessions:
+                    s.SimpleAudioVolume.SetMasterVolume(
+                        _ducked_sessions[s.Process.pid], None)
+            _ducked_sessions = {}
+    except Exception:
+        pass
+
+
+def minimize_windows():
+    """Minimizes all windows (Win+D) -- 'clear my screen'."""
+    keyboard.send("windows+d")
+    return "Screen cleared."
+
+
+def dictation_mode(max_seconds=120):
+    """Types what you say into whatever window has focus -- say 'stop
+    dictation' (or just 'stop') to finish. Audio goes through the same
+    Groq Whisper STT as normal commands; nothing is stored."""
+    import voice_input
+    deadline = time.time() + float(max_seconds)
+    typed_chunks = 0
+    if SPEAK_FN:
+        SPEAK_FN("Dictation on. Speak, and say stop dictation when done.")
+    while time.time() < deadline:
+        try:
+            text = voice_input.listen(max_wait=6)
+        except Exception:
+            break
+        if not text:
+            continue
+        if text.lower().strip().rstrip(".!") in ("stop", "stop dictation", "end dictation"):
+            break
+        keyboard.write(text + " ")
+        typed_chunks += 1
+    return f"Dictation finished -- typed {typed_chunks} segment(s)."
+
+
+def describe_screen():
+    """Speaks a 2-sentence summary of what's currently on screen. Note:
+    this sends one screenshot to Groq's vision model (same as
+    solve_from_screenshot) -- the answer is spoken, nothing is saved."""
+    screenshot_path = take_screenshot()
+    img = Image.open(screenshot_path)
+    img.thumbnail((1400, 1400))
+    compressed_path = screenshot_path.rsplit(".", 1)[0] + "_desc.jpg"
+    img.convert("RGB").save(compressed_path, "JPEG", quality=75)
+    with open(compressed_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    text, error = _call_groq(
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe what is on this screen in at most 2 plain sentences, spoken-style, no markdown."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+            ],
+        }],
+        model=GROQ_VISION_MODEL, max_tokens=120,
+    )
+    for p in (screenshot_path, compressed_path):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return text or f"Couldn't read the screen: {error}"
+
+
+def run_diagnostics():
+    """Self-test: checks each subsystem and reports what's broken.
+    Read-only -- makes one tiny request per service, changes nothing."""
+    results = []
+
+    def check(name, fn):
+        try:
+            ok, detail = fn()
+            results.append(f"{name}: {'OK' if ok else 'FAIL'}{' -- ' + detail if detail else ''}")
+        except Exception as e:
+            results.append(f"{name}: FAIL -- {e}")
+
+    def _mic():
+        import sounddevice as sd
+        dev = sd.query_devices(kind="input")
+        return True, dev.get("name", "")
+
+    def _groq():
+        if not GROQ_API_KEY:
+            return False, "GROQ_API_KEY not set"
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=10)
+        return r.ok, f"HTTP {r.status_code}"
+
+    def _ollama():
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        models = [m["name"] for m in r.json().get("models", [])]
+        return r.ok, ", ".join(models) or "no models pulled"
+
+    def _spotify():
+        if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+            return False, "credentials not configured"
+        return _get_spotify_client() is not None, ""
+
+    def _cf():
+        import cf_tracker
+        handle = cf_tracker._get_cf_handle()
+        if not handle:
+            return False, "cf_handle not set in jarvis_config.json"
+        r = requests.get("https://codeforces.com/api/user.info",
+                         params={"handles": handle}, timeout=10)
+        return r.json().get("status") == "OK", f"handle {handle}"
+
+    def _speaker():
+        _volume_interface()
+        return True, ""
+
+    check("Microphone", _mic)
+    check("Speaker/volume", _speaker)
+    check("Groq API", _groq)
+    check("Ollama", _ollama)
+    check("Spotify", _spotify)
+    check("Codeforces API", _cf)
+    failed = sum(1 for r in results if "FAIL" in r)
+    verdict = "All systems operational, sir." if failed == 0 else f"{failed} system(s) need attention."
+    return verdict + "\n" + "\n".join(results)
+
+
+def run_routine(name):
+    """Runs a user-defined routine from jarvis_config.json -- a named
+    list of plain-language commands executed in order. Define like:
+    "routines": {"good night": ["whisper mode on", "mute", "lock the screen"]}"""
+    routines = _USER_CONFIG.get("routines", {})
+    key = (name or "").lower().strip()
+    steps = routines.get(key)
+    if steps is None:
+        match = [k for k in routines if key in k]
+        if len(match) == 1:
+            key, steps = match[0], routines[match[0]]
+    if steps is None:
+        available = ", ".join(routines) or "none defined yet (add a 'routines' block to jarvis_config.json)"
+        return f"No routine called '{name}'. Available: {available}."
+
+    import intent_parser  # lazy: intent_parser imports this module at load
+    outcomes = []
+    for step in steps:
+        try:
+            parsed = intent_parser.parse_command(step)
+            for action in parsed.get("actions", []):
+                fn = action.get("function")
+                if fn == "chat" or fn == "run_routine":
+                    continue  # no chatting or recursion inside routines
+                outcomes.append(run_function(fn, action.get("args", {})))
+        except Exception as e:
+            outcomes.append(f"Error on step '{step}': {e}")
+    done = "; ".join(o for o in outcomes if o) or "nothing ran"
+    return f"Routine '{key}' complete: {done}"
+
+
+def show_streaks():
+    """Current day-streaks: consecutive days with a CF solve, and
+    consecutive gym days (Sundays don't break the gym streak -- rest
+    day)."""
+    import cf_tracker
+    today = datetime.date.today()
+
+    # CF streak from the local submissions DB
+    conn = cf_tracker._get_db()
+    rows = conn.execute("SELECT DISTINCT date(solved_at, 'unixepoch', 'localtime') d FROM cf_submissions").fetchall()
+    conn.close()
+    cf_days = {r["d"] for r in rows}
+    cf_streak = 0
+    day = today
+    if day.isoformat() not in cf_days:
+        day = day - datetime.timedelta(days=1)  # today isn't over yet
+    while day.isoformat() in cf_days:
+        cf_streak += 1
+        day -= datetime.timedelta(days=1)
+
+    # gym streak from the progress log
+    data = _load_progress_log()
+    gym_days = {d for d, e in data.items() if e.get("exercises") or "distance" in e}
+    gym_streak = 0
+    day = today
+    if day.isoformat() not in gym_days:
+        day = day - datetime.timedelta(days=1)
+    while True:
+        if day.strftime("%A") == "Sunday":
+            day -= datetime.timedelta(days=1)
+            continue
+        if day.isoformat() in gym_days:
+            gym_streak += 1
+            day -= datetime.timedelta(days=1)
+        else:
+            break
+
+    parts = []
+    parts.append(f"CF solve streak: {cf_streak} day(s)" if cf_streak else "No active CF streak")
+    parts.append(f"gym streak: {gym_streak} day(s)" if gym_streak else "no active gym streak")
+    return ", ".join(parts) + "."
+
+
+# ---------------------------------------------------------------------------
+# Voice output settings (read by main._speak)
+# ---------------------------------------------------------------------------
+
+def set_whisper_mode(state=True):
+    """Manually toggles quiet mode -- TTS plays at reduced volume. Quiet
+    hours (11 PM - 7 AM) apply automatically regardless of this toggle."""
+    global WHISPER_MODE
+    WHISPER_MODE = bool(state)
+    return "Whisper mode on -- I'll keep it down, sir." if WHISPER_MODE else "Whisper mode off."
+
+
+def set_voice_speed(percent=0):
+    """Adjusts TTS speaking rate. percent is -50 (slowest) to 50 (fastest),
+    0 = normal."""
+    global VOICE_RATE
+    VOICE_RATE = max(-50, min(50, int(percent)))
+    if VOICE_RATE == 0:
+        return "Speaking at normal speed."
+    return f"Speaking rate set to {VOICE_RATE:+d} percent."
+
+
+VOICE_CHOICES = {
+    "aria": "en-US-AriaNeural",
+    "jenny": "en-US-JennyNeural",
+    "guy": "en-US-GuyNeural",
+    "sonia": "en-GB-SoniaNeural",
+    "ryan": "en-GB-RyanNeural",
+}
+
+
+def set_orb_alignment(mode="auto"):
+    """Switches the orb's nature: 'angel' (white-gold halos, rising
+    motes), 'demon' (black eclipse core, crimson corona, fractured
+    halos, sinking embers), or 'auto' (angelic normally, demonic on
+    errors and red easter eggs)."""
+    import orb_renderer
+    mode = (mode or "auto").lower().strip()
+    if mode not in ("angel", "demon", "auto"):
+        return f"Unknown alignment '{mode}'. Options: angel, demon, auto."
+    orb_renderer.set_alignment(mode)
+    if mode == "demon":
+        return "Embracing the darkness, sir."
+    if mode == "angel":
+        return "Ascending. As it should be."
+    return "Orb alignment back to automatic."
+
+
+def set_voice(name="aria"):
+    """Switches the TTS voice. Options: aria, jenny, guy (US); sonia,
+    ryan (British)."""
+    global VOICE_NAME
+    key = name.lower().strip()
+    if key not in VOICE_CHOICES:
+        return f"Unknown voice '{name}'. Options: {', '.join(VOICE_CHOICES)}."
+    VOICE_NAME = VOICE_CHOICES[key]
+    return f"Voice switched to {key.capitalize()}. How do I sound, sir?"
+
+
 # ---------------------------------------------------------------------------
 # Coding / work shortcuts
 # ---------------------------------------------------------------------------
@@ -210,9 +862,10 @@ def take_screenshot():
 
 
 def save_note(text):
-    with open(NOTES_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] {text}\n")
-    return "Note saved."
+    """Legacy alias -- notes now go to the Obsidian vault inbox. Kept in
+    FUNCTION_REGISTRY (not the manifest) in case anything internal still
+    calls it; jarvis_notes.txt is no longer written."""
+    return capture_note(text)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +931,7 @@ CF_LETTERS = ["A", "B", "C", "D", "E", "F", "G"]
 
 
 def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
-                  problems_solved=None, cf_breakdown=None):
+                  problems_solved=None, cf_breakdown=None, bodyweight=None):
     """Logs today's numbers. `weights` is a list of numbers in the order
     you say them, matched positionally to today's exercise list from
     WEEKLY_ROUTINE (so you can just say "60, 25, 15, 40, 20, 15, 18" and
@@ -297,10 +950,29 @@ def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
     entry = data.get(today, {})
     entry.setdefault("exercises", {})
 
+    def _previous_best(exercise):
+        best = None
+        for date, e in data.items():
+            if date == today:
+                continue
+            w = e.get("exercises", {}).get(exercise)
+            if w is not None and (best is None or w > best):
+                best = w
+        return best
+
+    new_prs = []
+
+    def _record(name, w):
+        w = float(w)
+        prev = _previous_best(name)
+        if prev is not None and w > prev:
+            new_prs.append(f"{name} {w}kg (previous best {prev}kg)")
+        entry["exercises"][name] = w
+
     if weights is not None:
         todays_list = WEEKLY_ROUTINE.get(day_name, [])
         for name, w in zip(todays_list, weights):
-            entry["exercises"][name] = float(w)
+            _record(name, w)
         leftover = len(weights) - len(todays_list)
         if leftover > 0:
             return (
@@ -310,12 +982,14 @@ def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
             )
     if exercises is not None:
         for name, w in exercises.items():
-            entry["exercises"][name] = float(w)
+            _record(name, w)
 
     if distance is not None:
         entry["distance"] = float(distance)
     if run_minutes is not None:
         entry["run_minutes"] = float(run_minutes)
+    if bodyweight is not None:
+        entry["bodyweight"] = float(bodyweight)
     if cf_breakdown is not None:
         breakdown = {
             letter: int(count)
@@ -338,13 +1012,18 @@ def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
         if "run_minutes" in entry and entry["distance"]:
             pace = f" ({entry['run_minutes'] / entry['distance']:.1f} min/km)"
         parts.append(f"{entry['distance']}km run" + (f" in {entry['run_minutes']}min{pace}" if "run_minutes" in entry else pace))
+    if "bodyweight" in entry:
+        parts.append(f"bodyweight {entry['bodyweight']}kg")
     if "problems_solved" in entry:
         if entry.get("cf_breakdown"):
             breakdown_str = ", ".join(f"{k}: {v}" for k, v in entry["cf_breakdown"].items())
             parts.append(f"{entry['problems_solved']} CF problems solved ({breakdown_str})")
         else:
             parts.append(f"{entry['problems_solved']} CF problems solved")
-    return f"Logged for today: {', '.join(parts) if parts else 'nothing yet'}."
+    msg = f"Logged for today: {', '.join(parts) if parts else 'nothing yet'}."
+    if new_prs:
+        msg += " NEW PERSONAL RECORD on " + "; ".join(new_prs) + ". Outstanding, sir!"
+    return msg
 
 
 def has_logged_today():
@@ -408,6 +1087,10 @@ def show_progress(days=7):
     ]
     if paces:
         lines.append(f"- Run pace (min/km): {_trend([round(p, 1) for p in paces])}")
+
+    bodyweights = [e["bodyweight"] for _, e in recent if "bodyweight" in e]
+    if bodyweights:
+        lines.append(f"- Bodyweight (kg): {_trend(bodyweights)}")
 
     problems = [e["problems_solved"] for _, e in recent if "problems_solved" in e]
     if problems:
@@ -490,6 +1173,25 @@ def generate_progress_charts(month=None, year=None):
         plt.close()
         saved.append(path)
 
+    # line chart: bodyweight over the month
+    bw_xs, bw_ys = [], []
+    for label, (_, e) in zip(day_labels, month_entries):
+        if "bodyweight" in e:
+            bw_xs.append(label)
+            bw_ys.append(e["bodyweight"])
+    if bw_ys:
+        plt.figure(figsize=(8, 4))
+        plt.plot(bw_xs, bw_ys, marker="o", color="#cc44aa")
+        plt.title(f"Bodyweight (kg) -- {year}-{month:02d}")
+        plt.xlabel("Day")
+        plt.ylabel("kg")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(out_dir, "bodyweight.png")
+        plt.savefig(path)
+        plt.close()
+        saved.append(path)
+
     # bar chart: CF problems solved per day (total)
     cf_xs, cf_ys = [], []
     for label, (_, e) in zip(day_labels, month_entries):
@@ -542,7 +1244,7 @@ def generate_progress_charts(month=None, year=None):
             f.write(assessment)
 
     subprocess.Popen(f'explorer "{out_dir}"', shell=True)
-    note = " Hermes left a note in assessment.txt." if assessment else ""
+    note = " The local model left a note in assessment.txt." if assessment else ""
     return f"Saved {len(saved)} chart(s) to {out_dir} (opened in Explorer).{note}"
 
 
@@ -599,11 +1301,12 @@ def _get_hermes_assessment(month_entries, month, year):
         raw = json.dumps(payload, indent=2)
         client = ollama.Client(host="http://localhost:11434")
         response = client.chat(
-            model="hermes3",
+            model="qwen3:8b",
             messages=[
                 {"role": "system", "content": HERMES_ASSESSMENT_PROMPT},
                 {"role": "user", "content": f"Data for {year}-{month:02d}:\n{raw}"},
             ],
+            think=False,  # qwen3: hidden reasoning starves the output
             options={"temperature": 0.4},
         )
         return response["message"]["content"].strip()
@@ -618,13 +1321,73 @@ def _popup(title, message):
     ctypes.windll.user32.MessageBoxW(0, message, title, 0x40 | 0x1000)
 
 
+# Named-timer registry: label -> (Timer, fire_at_epoch). Lets you list
+# and cancel timers instead of fire-and-forget.
+_timers = {}
+_timers_lock = threading.Lock()
+
+
 def set_timer(minutes=5, label="Timer"):
+    label = (label or "Timer").strip()
     def fire():
-        _popup("Jarvis", f"{label} is done!")
+        with _timers_lock:
+            _timers.pop(label, None)
+        if SPEAK_FN:
+            SPEAK_FN(f"{label} is done, sir.")
+        else:
+            _popup("Jarvis", f"{label} is done!")
     timer = threading.Timer(float(minutes) * 60, fire)
     timer.daemon = True
+    with _timers_lock:
+        old = _timers.pop(label, None)
+        if old:
+            old[0].cancel()
+        _timers[label] = (timer, time.time() + float(minutes) * 60)
     timer.start()
-    return f"Timer set for {minutes} minute(s)."
+    return f"Timer '{label}' set for {minutes} minute(s)."
+
+
+def list_timers():
+    """Lists running timers and their remaining time."""
+    with _timers_lock:
+        items = [(label, fire_at - time.time()) for label, (_, fire_at) in _timers.items()]
+    live = [(l, s) for l, s in items if s > 0]
+    if not live:
+        return "No timers running."
+    parts = [f"{l}: {int(s // 60)}m {int(s % 60)}s left" for l, s in live]
+    return "Running timers -- " + "; ".join(parts) + "."
+
+
+def cancel_timer(label="Timer"):
+    """Cancels a named timer (or the default 'Timer')."""
+    label = (label or "Timer").strip()
+    with _timers_lock:
+        entry = _timers.pop(label, None)
+        if entry is None:
+            # fuzzy: single partial match wins
+            matches = [l for l in _timers if label.lower() in l.lower()]
+            if len(matches) == 1:
+                entry = _timers.pop(matches[0])
+                label = matches[0]
+    if entry is None:
+        return f"No timer named '{label}' found."
+    entry[0].cancel()
+    return f"Cancelled timer '{label}'."
+
+
+def rest_timer(seconds=90):
+    """Between-sets rest timer -- announces out loud when rest is over,
+    so you don't have to look at anything with chalk on your hands."""
+    seconds = max(5, float(seconds))
+    def fire():
+        if SPEAK_FN:
+            SPEAK_FN("Rest over, sir. Next set.")
+        else:
+            _popup("Jarvis", "Rest over -- next set!")
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    return f"Resting {int(seconds)} seconds. I'll call it."
 
 
 # ---------------------------------------------------------------------------
@@ -830,9 +1593,17 @@ def find_files(query, search_dir=None):
 
     if not matches:
         return f"No files found matching '{query}'."
-    os.startfile(matches[0])
+    first = matches[0]
     extra = f" (+{len(matches) - 1} more found)" if len(matches) > 1 else ""
-    return f"Opened: {os.path.basename(matches[0])}{extra}"
+    # Never execute a matched file -- os.startfile on an .exe/.bat RUNS it,
+    # which a fuzzy voice-matched search should never do. Reveal it in
+    # Explorer instead; only genuinely inert documents get opened directly.
+    ext = os.path.splitext(first)[1].lower()
+    if ext in (".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".scr", ".lnk"):
+        subprocess.Popen(f'explorer /select,"{first}"', shell=True)
+        return f"Found executable {os.path.basename(first)} -- showed it in Explorer instead of running it.{extra}"
+    os.startfile(first)
+    return f"Opened: {os.path.basename(first)}{extra}"
 
 
 def open_folder(name):
@@ -847,6 +1618,29 @@ def open_folder(name):
 # ---------------------------------------------------------------------------
 # System monitoring
 # ---------------------------------------------------------------------------
+
+def buzz_pc(times=5):
+    """Plays loud locator beeps so you can find the PC (or check it's
+    on) from the phone remote. Unmutes and raises volume first, since a
+    muted buzzer finds nothing."""
+    try:
+        mute(False)
+        set_volume(85)
+    except Exception:
+        pass
+
+    def _beep():
+        try:
+            import winsound
+            for _ in range(max(1, int(times))):
+                winsound.Beep(1600, 400)
+                time.sleep(0.15)
+        except Exception:
+            pass
+
+    threading.Thread(target=_beep, daemon=True).start()
+    return "Buzzing the PC now."
+
 
 def system_status():
     """Reports current CPU, RAM, and battery usage."""
@@ -1053,39 +1847,157 @@ def end_focus_session():
 
 
 # ---------------------------------------------------------------------------
+# Contest mode -- battle stations for a CF round
+# ---------------------------------------------------------------------------
+
+_contest_mode_active = False
+
+
+def contest_mode():
+    """Locks in for a Codeforces contest: closes configured distracting
+    apps, opens the contests page, tints the orb red, and announces
+    elapsed time every 30 minutes until end_contest_mode (auto-expires
+    after 3.5 hours)."""
+    global _contest_mode_active
+    if _contest_mode_active:
+        return "Contest mode is already active, sir."
+    _contest_mode_active = True
+
+    closed = set()
+    for proc in psutil.process_iter(["name"]):
+        if proc.info.get("name") in DISTRACTION_PROCESSES:
+            try:
+                proc.terminate()
+                closed.add(proc.info["name"])
+            except Exception:
+                pass
+
+    webbrowser.open("https://codeforces.com/contests")
+    if ORB_CONTROLLER:
+        ORB_CONTROLLER.set_color(255, 40, 40)
+
+    def _ticker():
+        elapsed = 0
+        while _contest_mode_active and elapsed < int(3.5 * 3600):
+            time.sleep(1800)
+            elapsed += 1800
+            if _contest_mode_active and SPEAK_FN:
+                SPEAK_FN(f"{elapsed // 60} minutes in, sir. Keep pushing.")
+        # auto-expire so the orb doesn't stay red forever
+        if _contest_mode_active:
+            end_contest_mode()
+
+    threading.Thread(target=_ticker, daemon=True).start()
+    closed_msg = f" Closed: {', '.join(closed)}." if closed else ""
+    return f"Contest mode engaged. Distractions cleared, problems opening.{closed_msg} Good hunting, sir."
+
+
+_demon_mode_active = False
+
+
+def demon_mode(minutes=60):
+    """Focus mode with teeth: closes every configured distraction app,
+    and the orb transforms into a pair of demonic eyes that stay on
+    screen watching you -- blinking, gaze wandering, locking onto you --
+    until the time runs out or you say 'end demon mode'. All visual;
+    nothing is recorded and no camera is involved."""
+    global _demon_mode_active
+    if _demon_mode_active:
+        return "The eyes are already upon you, sir."
+    _demon_mode_active = True
+
+    closed = set()
+    for proc in psutil.process_iter(["name"]):
+        if proc.info.get("name") in DISTRACTION_PROCESSES:
+            try:
+                proc.terminate()
+                closed.add(proc.info["name"])
+            except Exception:
+                pass
+
+    import orb_renderer
+    orb_renderer.set_eyes_mode(True)
+    if ORB_CONTROLLER:
+        # custom state keeps the window visible (idle would auto-hide it)
+        ORB_CONTROLLER.set_color(255, 30, 30)
+
+    def _expire():
+        time.sleep(float(minutes) * 60)
+        if _demon_mode_active:
+            end_demon_mode()
+            if SPEAK_FN:
+                SPEAK_FN("Demon mode has run its course. You are free, sir.")
+
+    threading.Thread(target=_expire, daemon=True).start()
+    closed_msg = f" Banished: {', '.join(closed)}." if closed else ""
+    return (f"Demon mode. Distractions are gone and the eyes are open for "
+            f"{int(minutes)} minutes.{closed_msg} Work.")
+
+
+def end_demon_mode():
+    """Ends demon mode -- the eyes close and the orb returns."""
+    global _demon_mode_active
+    if not _demon_mode_active:
+        return "Demon mode isn't active."
+    _demon_mode_active = False
+    import orb_renderer
+    orb_renderer.set_eyes_mode(False)
+    if ORB_CONTROLLER:
+        ORB_CONTROLLER.restore()
+    return "The eyes close. Well fought, sir."
+
+
+def end_contest_mode():
+    """Ends contest mode -- restores the orb and stops the elapsed-time
+    announcements."""
+    global _contest_mode_active
+    if not _contest_mode_active:
+        return "Contest mode isn't active."
+    _contest_mode_active = False
+    if ORB_CONTROLLER:
+        ORB_CONTROLLER.restore()
+    return "Contest mode disengaged. I'll fetch your results after the round is analyzed, sir."
+
+
+# ---------------------------------------------------------------------------
 # AI delegation -- hand work off to an LLM (Groq)
 # ---------------------------------------------------------------------------
 
-def _call_groq(messages, model, max_tokens=2000):
+def _call_groq(messages, model, max_tokens=2000, inject_memory=False):
     if not GROQ_API_KEY:
         return None, "GROQ_API_KEY environment variable is not set."
 
-    # Memory injection wraps every Groq call made through this helper
-    # (ask_ai, solve_from_screenshot) with a [JARVIS MEMORY] context
-    # block -- never rewrites the caller's messages, just prepends.
-    # Falls back to the original messages unchanged on any failure.
-    try:
-        import jarvis_memory
-        messages = jarvis_memory.inject_memory(messages)
-    except Exception:
-        pass
+    if inject_memory:
+        try:
+            import jarvis_memory
+            messages = jarvis_memory.inject_memory(messages)
+        except Exception:
+            pass
 
-    response = requests.post(
-        GROQ_API_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"], None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"], None
+        except Exception as e:
+            last_exc = e
+            if attempt == 0:
+                time.sleep(1)
+    return None, str(last_exc)
 
 
 def _save_and_open(text, filename_prefix):
@@ -1104,6 +2016,7 @@ def ask_ai(task):
     text, error = _call_groq(
         [{"role": "user", "content": task}],
         model=GROQ_TEXT_MODEL,
+        inject_memory=True,
     )
     if error:
         return error
@@ -1134,6 +2047,7 @@ def solve_from_screenshot(prompt="Solve this problem and explain your reasoning.
             ],
         }],
         model=GROQ_VISION_MODEL,
+        inject_memory=True,
     )
     if error:
         return error
@@ -1182,15 +2096,34 @@ def list_processes(top=5):
              for p in procs]
     return "Top processes:\n" + "\n".join(lines)
 
+# Never kill these even on a substring match -- a mis-heard voice command
+# matching "system", "host", or "explorer" would otherwise take down the
+# shell or core Windows services.
+PROTECTED_PROCESSES = {
+    "explorer.exe", "svchost.exe", "csrss.exe", "winlogon.exe", "lsass.exe",
+    "services.exe", "smss.exe", "wininit.exe", "system", "registry",
+    "dwm.exe", "python.exe", "pythonw.exe",  # last two: Jarvis itself
+}
+
+
 def kill_process(name):
-    killed = []
+    killed, skipped = [], []
     for proc in psutil.process_iter(["name"]):
-        if name.lower() in (proc.info["name"] or "").lower():
+        pname = proc.info["name"] or ""
+        if name.lower() in pname.lower():
+            if pname.lower() in PROTECTED_PROCESSES:
+                skipped.append(pname)
+                continue
             try:
-                proc.kill(); killed.append(proc.info["name"])
+                proc.kill(); killed.append(pname)
             except Exception:
                 pass
-    return f"Killed: {', '.join(killed)}" if killed else f"No process found matching '{name}'."
+    if killed:
+        note = f" (skipped protected: {', '.join(set(skipped))})" if skipped else ""
+        return f"Killed: {', '.join(killed)}{note}"
+    if skipped:
+        return f"'{name}' only matched protected system processes -- not killing those."
+    return f"No process found matching '{name}'."
 
 def is_process_running(name):
     for proc in psutil.process_iter(["name"]):
@@ -1248,6 +2181,16 @@ def define_word(word):
     return result or err
 
 def calculate(expression):
+    import math
+    _safe_env = {k: getattr(math, k) for k in dir(math) if not k.startswith('_')}
+    _safe_env.update({'abs': abs, 'round': round, '__builtins__': {}})
+    try:
+        val = eval(expression, _safe_env, {})  # noqa: S307
+        if isinstance(val, float) and val == int(val):
+            val = int(val)
+        return f"{expression} = {val}"
+    except Exception:
+        pass
     result, err = _call_groq(
         [{"role": "user", "content": f"Calculate: {expression}. Give just the answer with a one-sentence explanation."}],
         model=GROQ_TEXT_MODEL, max_tokens=80)
@@ -1328,32 +2271,49 @@ FUNCTION_MANIFEST = [
     {"name": "open_terminal", "description": "Opens a terminal window, optionally at a path.", "args": {"path": "string, optional"}},
     {"name": "open_site", "description": "Opens a website (configured shortcut name or any URL/domain).", "args": {"name": "string"}},
     {"name": "take_screenshot", "description": "Takes a screenshot and saves it.", "args": {}},
-    {"name": "save_note", "description": "Appends a timestamped free-text note to the notes file. Do NOT use this for workout weights, run distance/time, or CF problem counts -- those always go through log_progress instead, even if the user just says a bare list of numbers with the word 'log'.", "args": {"text": "string"}},
+    {"name": "ask_brain", "description": "Answers a question from the user's Obsidian notes. Use for 'ask my brain X', 'what do my notes say about X', 'what did I decide about X', 'when did I X'.", "args": {"query": "string, the question"}},
+    {"name": "capture_note", "description": "Appends a spoken note to the Obsidian vault inbox. Use for 'note that X', 'remember that X', 'capture X', 'save a note'. Set todo=true for tasks/todos ('add a task to X', 'remind me to X later', 'add X to my list'). NOT for workout weights/run/CF counts -- those go through log_progress.", "args": {"text": "string, the note content", "todo": "bool, true if it's a task"}},
+    {"name": "dictate_to_note", "description": "Long-form dictation saved as a vault draft note (NOT typed into a window). Use for 'dictate a note', 'take down a draft', 'dictate into my notes'.", "args": {"max_seconds": "number, optional, default 180"}},
+    {"name": "capture_screen_note", "description": "Captures an AI description of the current screen plus an optional spoken comment as one inbox note. Use for 'note what I'm looking at', 'capture this screen with a note'.", "args": {"comment": "string, optional, the user's comment"}},
+    {"name": "list_tasks", "description": "Speaks open (unchecked) tasks from the vault. Use for 'what are my tasks', 'what's on my list'.", "args": {}},
+    {"name": "complete_task", "description": "Marks an open task done by name. Use for 'mark X done', 'I finished X', 'check off X'.", "args": {"name": "string, words from the task"}},
     {"name": "todays_workout", "description": "Lists today's lifts from the weekly workout split, in order.", "args": {}},
-    {"name": "log_progress", "description": "Logs today's gym/run/CF numbers. ALWAYS use this (never save_note) whenever the user says 'log' followed by a list of bare numbers (e.g. 'log 85 20 25 60 45 25') -- pass them as `weights` in the order given, and they'll be matched to today's exercises in order automatically. If the user names specific exercises, pass `exercises` as a {exercise_name: weight} object instead. For CF problems solved 'in order A, B, C, D' (e.g. 'I solved 3, 4, 1, 0 problems today'), pass `cf_breakdown` as a list of counts in that A/B/C/D... order -- it auto-sums into the total. Only pass the fields actually mentioned -- can be called multiple times per day.", "args": {"weights": "list of numbers, optional, weights in the order today's exercises are listed", "exercises": "object, optional, {exercise_name: weight_kg} for naming specific lifts", "distance": "number, optional, km run", "run_minutes": "number, optional, minutes taken for the run", "cf_breakdown": "list of ints, optional, CF problems solved per letter in order A, B, C, D...", "problems_solved": "int, optional, CF total with no breakdown"}},
+    {"name": "log_progress", "description": "Logs today's gym/run/CF numbers. ALWAYS use this (never capture_note) whenever the user says 'log' followed by a list of bare numbers (e.g. 'log 85 20 25 60 45 25') -- pass them as `weights` in the order given, and they'll be matched to today's exercises in order automatically. If the user names specific exercises, pass `exercises` as a {exercise_name: weight} object instead. For CF problems solved 'in order A, B, C, D' (e.g. 'I solved 3, 4, 1, 0 problems today'), pass `cf_breakdown` as a list of counts in that A/B/C/D... order -- it auto-sums into the total. Only pass the fields actually mentioned -- can be called multiple times per day.", "args": {"weights": "list of numbers, optional, weights in the order today's exercises are listed", "exercises": "object, optional, {exercise_name: weight_kg} for naming specific lifts", "distance": "number, optional, km run", "run_minutes": "number, optional, minutes taken for the run", "cf_breakdown": "list of ints, optional, CF problems solved per letter in order A, B, C, D...", "problems_solved": "int, optional, CF total with no breakdown", "bodyweight": "number, optional, body weight kg ('I weighed 78.2')"}},
     {"name": "show_progress", "description": "Summarizes logged progress over the last N days -- per-exercise weight trend, run pace trend, and CF problems trend.", "args": {"days": "int, optional, default 7"}},
-    {"name": "generate_progress_charts", "description": "Builds and saves line/bar chart PNGs for a given month, defaulting to the current month: per-exercise weight over time, run pace, CF problems solved (total bar chart AND a per-letter A/B/C/D breakdown line chart, same style as the per-exercise charts), plus an assessment.txt written by the local Hermes model judging whether progress was good/bad on each metric. Opens the folder in Explorer when done.", "args": {"month": "int, optional, 1-12, defaults to current month", "year": "int, optional, defaults to current year"}},
+    {"name": "generate_progress_charts", "description": "Builds and saves line/bar chart PNGs for a given month, defaulting to the current month: per-exercise weight over time, run pace, CF problems solved (total bar chart AND a per-letter A/B/C/D breakdown line chart, same style as the per-exercise charts), plus an assessment.txt written by the local Ollama model judging whether progress was good/bad on each metric. Opens the folder in Explorer when done.", "args": {"month": "int, optional, 1-12, defaults to current month", "year": "int, optional, defaults to current year"}},
     {"name": "cf_rating", "description": "Current Codeforces rating (auto-tracked via the CF API) and the change vs one week ago.", "args": {}},
     {"name": "cf_today", "description": "Problems solved on Codeforces today (auto-tracked), with problem names.", "args": {}},
     {"name": "cf_last_contest", "description": "Breakdown of your most recently FINISHED Codeforces contest -- problems solved, first-AC time per problem, wrong-submission penalty.", "args": {}},
     {"name": "cf_monthly_summary", "description": "Codeforces summary for a month (auto-tracked) -- problems solved by index (A/B/C/D...), rating delta, contests participated.", "args": {"month": "int, optional, defaults to current month", "year": "int, optional, defaults to current year"}},
     {"name": "cf_upcoming_contest", "description": "Next upcoming Codeforces contest (Div 1/2/1+2/Educational) and time remaining until it starts.", "args": {}},
+    {"name": "cf_upsolve", "description": "Lists contest problems the user attempted but never solved (upsolve targets), skipping ones solved since. Use when user asks 'what should I upsolve' or 'pending upsolves'.", "args": {}},
+    {"name": "contest_mode", "description": "Locks in for a Codeforces contest: closes distracting apps, opens the contests page, turns the orb red, and announces elapsed time every 30 minutes. Use when user says 'contest mode' or 'contest time'.", "args": {}},
+    {"name": "end_contest_mode", "description": "Ends contest mode and restores the orb. Use when user says 'end contest mode' or 'contest is over'.", "args": {}},
+    {"name": "rest_timer", "description": "Between-sets gym rest timer -- speaks 'rest over' aloud when done. Use when user says 'rest 90' or 'rest timer 2 minutes' (convert minutes to seconds).", "args": {"seconds": "number, default 90"}},
+    {"name": "set_whisper_mode", "description": "Toggles quiet TTS mode (lower speaking volume). Use for 'whisper mode', 'be quiet', 'speak quietly', 'normal volume voice'.", "args": {"state": "bool, true for on"}},
+    {"name": "set_voice_speed", "description": "Changes how fast Jarvis talks. Use 'talk faster' -> 20, 'talk slower' -> -20, 'normal speed' -> 0.", "args": {"percent": "int -50 to 50, 0 = normal"}},
+    {"name": "set_voice", "description": "Switches the TTS voice. Options: aria, jenny, guy (US); sonia, ryan (British).", "args": {"name": "string, one of: aria, jenny, guy, sonia, ryan"}},
+    {"name": "buzz_pc", "description": "Plays loud locator beeps on the PC (unmutes first). Use for 'find my pc', 'buzz the computer', 'make some noise'.", "args": {"times": "int, default 5"}},
+    {"name": "list_timers", "description": "Lists all running timers with remaining time. Use for 'what timers are running' or 'how long left on my timer'.", "args": {}},
+    {"name": "cancel_timer", "description": "Cancels a running timer by its label. Use for 'cancel the pasta timer' -> label='pasta'.", "args": {"label": "string, the timer's label"}},
+    {"name": "run_diagnostics", "description": "Self-test of all subsystems (mic, speaker, Groq, Ollama, Spotify, Codeforces API) and reports what's broken. Use for 'run diagnostics' or 'system check'.", "args": {}},
+    {"name": "run_routine", "description": "Runs a user-defined multi-step routine from jarvis_config.json by name. Use when the user says a routine name like 'good night' or 'run my morning routine'.", "args": {"name": "string, routine name"}},
+    {"name": "show_streaks", "description": "Reports the current CF solve day-streak and gym day-streak. Use for 'what's my streak'.", "args": {}},
+    {"name": "cf_drill", "description": "Practice drill -- opens a random unsolved Codeforces problem rated ~offset above the user's rating. Use for 'give me a problem', 'drill me', 'practice problem'.", "args": {"offset": "int, optional, rating points above current, default 100"}},
+    {"name": "dictation_mode", "description": "Types whatever the user speaks into the focused window until they say 'stop dictation'. Use for 'take dictation' or 'type what I say'.", "args": {"max_seconds": "number, optional, default 120"}},
+    {"name": "minimize_windows", "description": "Minimizes all windows to show the desktop. Use for 'clear my screen', 'minimize everything', 'show desktop'.", "args": {}},
+    {"name": "describe_screen", "description": "Speaks a 2-sentence summary of what's currently visible on screen. Use for 'what's on my screen', 'describe my screen'.", "args": {}},
+    {"name": "set_orb_alignment", "description": "Switches the orb's visual nature. Use 'go demonic'/'dark mode orb' -> mode='demon', 'go angelic'/'be an angel' -> mode='angel', 'orb back to normal' -> mode='auto'.", "args": {"mode": "string: angel, demon, or auto"}},
+    {"name": "demon_mode", "description": "ALWAYS use this when the user says 'demon mode': closes all distraction apps (focus mode) AND transforms the orb into a pair of watching demonic eyes for the duration. Not the same as set_orb_alignment.", "args": {"minutes": "number, optional, default 60"}},
+    {"name": "end_demon_mode", "description": "Ends demon mode -- eyes close, orb returns. Use for 'end demon mode', 'stop watching me', 'release me'.", "args": {}},
     {"name": "check_in", "description": "Triggers the mood/energy check-in flow -- Jarvis asks about energy, mood, and soreness/injuries via voice, then speaks an adjusted plan for today. Use this whenever the user says things like 'check in', 'how am I doing', or asks about their energy/mood.", "args": {}},
     {"name": "memory_summary", "description": "Speaks today's distilled memory summary (generated nightly at 11 PM from the past week's activity).", "args": {}},
     {"name": "whats_my_plan", "description": "Reads today's plan adjustment (from the last mood check-in), whether today is a workout day, and the next upcoming CF contest.", "args": {}},
     {"name": "last_time", "description": "Looks up the last time the user asked about or did something related to a topic, e.g. 'last time I asked about Spotify'.", "args": {"topic": "string, the topic/keyword to search for"}},
-    {"name": "easter_dont_leave", "description": "Triggers ONLY when the user says the exact phrase 'jarvis don't leave me buddy'. A scripted emotional sequence, ends by putting the PC to sleep.", "args": {}},
-    {"name": "easter_rumble", "description": "Triggers ONLY when the user says the exact phrase 'jarvis rumble'. Attack on Titan themed sequence.", "args": {}},
-    {"name": "easter_inevitable", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i am inevitable'. Thanos themed sequence that scans (not deletes) the Downloads folder.", "args": {}},
-    {"name": "easter_rick", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i used to be you'. Rick and Morty themed sequence.", "args": {}},
-    {"name": "easter_on_your_left", "description": "Triggers ONLY when the user says the exact phrase 'jarvis on your left'. Avengers Endgame themed sequence that opens several apps in order.", "args": {}},
-    {"name": "easter_evangelion", "description": "Triggers ONLY when the user says the exact phrase 'jarvis get in the robot'. Evangelion themed sequence.", "args": {}},
-    {"name": "easter_mandalorian", "description": "Triggers ONLY when the user says the exact phrase 'jarvis this is the way'. Mandalorian themed focus-session sequence.", "args": {}},
-    {"name": "easter_shirou", "description": "Triggers ONLY when the user says the exact phrase 'jarvis people die when they are killed'. Fate themed sequence, ends by putting the PC to sleep.", "args": {}},
-    {"name": "easter_deathnote_chip", "description": "Triggers ONLY when the user says the exact phrase about taking a potato chip and eating it. Death Note themed sequence.", "args": {}},
-    {"name": "easter_mha", "description": "Triggers ONLY when the user says the exact phrase 'jarvis go beyond'. My Hero Academia themed sequence.", "args": {}},
-    {"name": "easter_keikaku", "description": "Triggers ONLY when the user says the exact phrase 'jarvis just according to keikaku'. Death Note themed sequence reading today's real progress data.", "args": {}},
-    {"name": "easter_pokemon", "description": "Triggers ONLY when the user says the exact phrase 'jarvis i choose you'. Pokemon themed sequence.", "args": {}},
+    # NOTE: easter eggs are intentionally NOT in this manifest -- they're
+    # exact-phrase triggers matched locally in intent_parser
+    # (EXACT_PHRASE_TRIGGERS) at zero token cost. The functions stay
+    # importable above for FUNCTION_REGISTRY-free dispatch paths.
     {"name": "set_timer", "description": "Sets a timer/reminder that pops up an alert when done.", "args": {"minutes": "number", "label": "string, optional"}},
     {"name": "media_play_pause", "description": "Toggles play/pause on the active media player (e.g. Spotify).", "args": {}},
     {"name": "media_next", "description": "Skips to the next track.", "args": {}},
@@ -1392,6 +2352,33 @@ FUNCTION_MANIFEST = [
 
 FUNCTION_REGISTRY = {f["name"]: globals()[f["name"]] for f in FUNCTION_MANIFEST}
 
+# save_note: legacy alias, dispatchable but not in the manifest.
+FUNCTION_REGISTRY["save_note"] = save_note
+
+# Easter eggs stay dispatchable (phone remote uses the safe zero-arg
+# fallbacks) even though they're no longer in the manifest prompt.
+FUNCTION_REGISTRY.update({
+    name: globals()[name] for name in (
+        "easter_dont_leave", "easter_rumble", "easter_inevitable",
+        "easter_rick", "easter_on_your_left", "easter_evangelion",
+        "easter_mandalorian", "easter_shirou", "easter_deathnote_chip",
+        "easter_mha", "easter_keikaku", "easter_pokemon",
+    )
+})
+
+
+# Functions whose args/results carry personal content (clipboard text,
+# private notes, message bodies). Their event-log entries are redacted so
+# that content never lands in the memory DB -- which later gets sent to
+# Groq during the nightly distillation. Only the fact that the function
+# ran is recorded, which is all the nudge/memory layer actually needs.
+PRIVATE_FUNCTIONS = {
+    "read_clipboard", "summarize_clipboard", "translate_clipboard",
+    "save_note", "send_whatsapp", "draft_email", "ask_ai",
+    "solve_from_screenshot", "translate", "capture_note",
+    "dictate_to_note", "capture_screen_note",
+}
+
 
 def run_function(name, args=None):
     args = args or {}
@@ -1405,12 +2392,23 @@ def run_function(name, args=None):
     except Exception as e:
         result = f"Error running {name}: {e}"
 
+    # Status card on the phone remote shows the last action -- private
+    # functions keep their result masked here too.
+    LAST_ACTION.update({
+        "name": name,
+        "result": "[private]" if name in PRIVATE_FUNCTIONS else str(result)[:200],
+        "time": datetime.datetime.now().strftime("%H:%M"),
+    })
+
     # Event logging wraps the dispatcher -- every call gets recorded for
     # the memory layer. Failure here must never break the actual
     # dispatch, hence the blanket except.
     try:
         import jarvis_memory
-        jarvis_memory.log_event(name, args, result)
+        if name in PRIVATE_FUNCTIONS:
+            jarvis_memory.log_event(name, {"redacted": True}, "[content redacted for privacy]")
+        else:
+            jarvis_memory.log_event(name, args, result)
     except Exception:
         pass
 

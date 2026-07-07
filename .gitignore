@@ -28,3 +28,6 @@ Thumbs.db
 # Local dev-tool config -- not project source, not meant to be public
 .claude/
 .idea/
+
+# Render preview artifact -- regenerable
+orb_preview.png

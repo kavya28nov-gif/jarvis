@@ -127,6 +127,12 @@ def init_db():
         analyzed_at INTEGER
     );
     """)
+    # attempted_unsolved: added later for upsolve tracking -- ALTER fails
+    # harmlessly if the column already exists.
+    try:
+        conn.execute("ALTER TABLE cf_contest_results ADD COLUMN attempted_unsolved TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -246,13 +252,15 @@ def analyze_contest(contest_id):
     times_relative = {
         idx: t - start_time for idx, t in first_ac.items()
     } if start_time else first_ac
+    attempted_unsolved = sorted(set(wrong_before_ac) - solved)
 
     conn.execute(
         "INSERT OR REPLACE INTO cf_contest_results "
-        "(contest_id, name, solved_indexes, first_ac_times, wrong_submission_count, analyzed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(contest_id, name, solved_indexes, first_ac_times, wrong_submission_count, "
+        "analyzed_at, attempted_unsolved) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (contest_id, contest_name, json.dumps(sorted(solved)), json.dumps(times_relative),
-         penalty, int(time.time())),
+         penalty, int(time.time()), json.dumps(attempted_unsolved)),
     )
     if contest_row:
         conn.execute("UPDATE cf_contests SET participated=1 WHERE contest_id=?", (contest_id,))
@@ -264,6 +272,7 @@ def analyze_contest(contest_id):
         "solved_indexes": sorted(solved),
         "first_ac_times": times_relative,
         "penalty": penalty,
+        "attempted_unsolved": attempted_unsolved,
     }
 
 
@@ -338,11 +347,66 @@ def run_heartbeat_check(on_notify=None, play_alert=None):
         live = contests_by_id.get(cid)
         if live and live.get("phase") == "FINISHED":
             result = analyze_contest(cid)
+            if result:
+                _write_debrief_note(cid, result)
             if result and on_notify:
-                on_notify(
-                    f"Contest {result['name']} finished. "
-                    f"You solved {len(result['solved_indexes'])} problem(s)."
+                # full spoken debrief, not just a count
+                solved = result["solved_indexes"]
+                msg = f"Contest {result['name']} finished. "
+                msg += (f"You solved {', '.join(solved)}. " if solved
+                        else "No problems solved this time. ")
+                if result["penalty"]:
+                    msg += f"{result['penalty']} wrong submission(s) before your ACs. "
+                if result["attempted_unsolved"]:
+                    msg += (f"You attempted {', '.join(result['attempted_unsolved'])} "
+                            "without solving -- worth an upsolve.")
+                on_notify(msg.strip())
+
+
+def _write_debrief_note(contest_id, result):
+    """Writes the post-contest debrief into the Obsidian vault journal
+    as cf-<id>-debrief.md, with an upsolve checkbox per attempted-but-
+    unsolved problem. All public CF data; Jarvis-owned file, full
+    rewrite is fine. No-op if the vault isn't configured."""
+    try:
+        import jarvis_actions  # lazy -- jarvis_actions imports this module at load
+        journal = jarvis_actions._vault_subdir("journal")
+        if journal is None:
+            return
+        today = datetime.date.today().isoformat()
+        solved = result["solved_indexes"]
+        times = result.get("first_ac_times", {})
+        lines = [
+            "---",
+            f"date: {today}",
+            "type: cf-debrief",
+            f"contest_id: {contest_id}",
+            "tags:",
+            "  - codeforces",
+            "---",
+            "",
+            f"# {result['name']} — debrief #codeforces",
+            "",
+            f"- Solved: {', '.join(solved) if solved else 'none'}",
+            f"- Penalty (wrong submissions before AC): {result['penalty']}",
+        ]
+        for idx in sorted(times):
+            lines.append(f"- {idx} first AC at {int(times[idx] // 60)} min")
+        lines.append("")
+        if result.get("attempted_unsolved"):
+            lines.append("## Upsolve")
+            lines.append("")
+            for idx in result["attempted_unsolved"]:
+                lines.append(
+                    f"- [ ] Upsolve {idx} — "
+                    f"https://codeforces.com/contest/{contest_id}/problem/{idx}"
                 )
+            lines.append("")
+        (journal / f"cf-{contest_id}-debrief.md").write_text(
+            "\n".join(lines), encoding="utf-8")
+        logger.info(f"[cf debrief] wrote journal/cf-{contest_id}-debrief.md")
+    except Exception as e:
+        logger.error(f"[cf debrief error] {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +474,82 @@ def cf_upcoming_contest():
     hours, rem = divmod(seconds_left, 3600)
     minutes = rem // 60
     return f"Next contest: {row['name']} in {int(hours)}h {int(minutes)}m."
+
+
+def get_current_rating():
+    """Latest known rating as a plain int (or None) -- used by main.py to
+    tint the idle orb with the matching CF rank color."""
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT rating FROM cf_rating_history ORDER BY fetched_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return row["rating"] if row else None
+
+
+def cf_upsolve():
+    """Lists contest problems you attempted but never solved, from the
+    last few analyzed contests, skipping any you've since AC'd (the daily
+    submission fetch covers upsolves done after the contest)."""
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT * FROM cf_contest_results ORDER BY analyzed_at DESC LIMIT 5"
+    ).fetchall()
+    solved_pairs = {
+        (r["contest_id"], r["problem_index"])
+        for r in conn.execute("SELECT contest_id, problem_index FROM cf_submissions")
+    }
+    conn.close()
+
+    pending = []
+    for row in rows:
+        try:
+            attempted = json.loads(row["attempted_unsolved"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            attempted = []
+        remaining = [idx for idx in attempted
+                     if (row["contest_id"], idx) not in solved_pairs]
+        if remaining:
+            pending.append(f"{', '.join(remaining)} from {row['name']}")
+
+    if not pending:
+        return "No pending upsolves -- everything you attempted in recent contests is solved. Clean slate, sir."
+    return "Upsolve targets: " + "; ".join(pending) + "."
+
+
+def cf_drill(offset=100):
+    """Practice drill: picks a random unsolved problem rated about
+    `offset` above your current rating (public CF problemset API, same
+    surface as the rest of the tracker) and opens it."""
+    import random as _random
+    rating = get_current_rating()
+    if rating is None:
+        rating = 1200  # sensible default until the first rating fetch
+    target = rating + int(offset)
+
+    problems = _rate_limited_get("problemset.problems")
+    if not problems:
+        return "Couldn't reach the Codeforces problemset API -- try again in a bit."
+
+    conn = _get_db()
+    solved = {(r["contest_id"], r["problem_index"])
+              for r in conn.execute("SELECT contest_id, problem_index FROM cf_submissions")}
+    conn.close()
+
+    candidates = [
+        p for p in problems.get("problems", [])
+        if p.get("rating") is not None
+        and abs(p["rating"] - target) <= 100
+        and (p.get("contestId"), p.get("index")) not in solved
+    ]
+    if not candidates:
+        return f"No unsolved problems found around rating {target}."
+
+    pick = _random.choice(candidates)
+    url = f"https://codeforces.com/problemset/problem/{pick['contestId']}/{pick['index']}"
+    webbrowser.open(url)
+    return (f"Drill time: {pick['name']}, rated {pick['rating']}. "
+            f"It's open -- clock's running, sir.")
 
 
 def seconds_until_next_contest():

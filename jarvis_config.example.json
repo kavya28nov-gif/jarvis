@@ -1,3 +1,23 @@
 {
-  "cf_handle": ""
+  "cf_handle": "",
+  "project_paths": {
+    "example": "C:\\Users\\YourName\\Projects\\example"
+  },
+  "sites": {
+    "myblog": "https://example.com"
+  },
+  "whatsapp_contacts": {
+    "mom": "919876543210"
+  },
+  "whatsapp_default_country_code": "91",
+  "folder_shortcuts": {},
+  "vault_path": "C:\\path\\to\\your\\obsidian\\vault",
+  "vault_inbox": "inbox",
+  "vault_journal": "journal",
+  "vault_name": "your-vault-name",
+  "vault_retrieve_script": "scripts/retrieve.py",
+  "routines": {
+    "good night": ["whisper mode on", "mute", "lock the screen"],
+    "work mode": ["open codeforces", "start focus session for 45 minutes"]
+  }
 }

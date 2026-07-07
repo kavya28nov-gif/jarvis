@@ -35,6 +35,14 @@ log.setLevel(logging.ERROR)
 # run and printed/logged so you can still use the remote.
 PHONE_SERVER_TOKEN = os.environ.get("JARVIS_PHONE_TOKEN") or secrets.token_urlsafe(16)
 
+# Brute-force lockout: after MAX_FAILED_ATTEMPTS bad tokens from one IP,
+# that IP is blocked for LOCKOUT_SECONDS. Without this, anyone on the
+# WiFi could hammer /command guessing tokens indefinitely.
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_SECONDS = 300
+_failed_attempts = {}  # ip -> (count, first_failure_time)
+_attempts_lock = threading.Lock()
+
 
 @app.before_request
 def _require_token():
@@ -42,9 +50,37 @@ def _require_token():
     # finds this server on the WiFi should get a 401 immediately, not a
     # rendered UI (even a non-functional one reveals that Jarvis is
     # running here, which is more than a stranger should learn).
-    token = request.args.get("token") or request.headers.get("X-Jarvis-Token")
-    if token != PHONE_SERVER_TOKEN:
+    import time as _time
+    ip = request.remote_addr or "?"
+
+    with _attempts_lock:
+        count, first = _failed_attempts.get(ip, (0, 0))
+        if count >= MAX_FAILED_ATTEMPTS:
+            if _time.time() - first < LOCKOUT_SECONDS:
+                return jsonify({"status": "error", "error": "Too many failed attempts -- try again later."}), 429
+            del _failed_attempts[ip]
+
+    token = request.args.get("token") or request.headers.get("X-Jarvis-Token") or ""
+    # compare_digest: constant-time comparison, immune to timing attacks
+    if not secrets.compare_digest(token, PHONE_SERVER_TOKEN):
+        with _attempts_lock:
+            count, first = _failed_attempts.get(ip, (0, _time.time()))
+            _failed_attempts[ip] = (count + 1, first)
         return jsonify({"status": "error", "error": "Unauthorized -- missing or invalid token."}), 401
+
+    with _attempts_lock:
+        _failed_attempts.pop(ip, None)
+
+
+@app.after_request
+def _security_headers(resp):
+    # Results can contain personal data (notes, clipboard, statuses) --
+    # make sure the browser never caches them, and lock down framing/MIME.
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
 
 # ── HTML UI ───────────────────────────────────────────────────────────────────
 
@@ -207,12 +243,28 @@ _UI = """<!DOCTYPE html>
   <button class="send-btn" onclick="sendText()">Send</button>
 </div>
 
+<div class="quick-label">CAPTURE TO INBOX</div>
+<div class="input-row">
+  <input class="cmd-input" id="captureInput" type="text" placeholder="Thought to capture…" onkeydown="if(event.key==='Enter') captureNote(false)">
+  <button class="send-btn" onclick="captureNote(false)">Note</button>
+  <button class="send-btn" style="background:#3399ff" onclick="captureNote(true)">Task</button>
+</div>
+
+<div class="quick-label">STATUS</div>
+<div class="card" id="infoCard" style="width:100%;max-width:420px;margin-bottom:20px;">
+  <div class="card-result" id="infoText">loading…</div>
+</div>
+
 <div class="quick-label">QUICK ACTIONS</div>
 <div class="quick-grid">
   <button class="quick-btn" onclick="sendCommand('Lock the screen')">🔒 Lock PC</button>
   <button class="quick-btn" onclick="sendCommand('System status')">📊 System Status</button>
   <button class="quick-btn" onclick="sendCommand('Play pause media')">⏯ Play / Pause</button>
   <button class="quick-btn" onclick="sendCommand('Start focus session for 25 minutes')">🎯 Focus 25 min</button>
+  <button class="quick-btn" onclick="buzzPC()">📢 Find My PC</button>
+  <button class="quick-btn" onclick="sendCommand('Show todays workout')">🏋️ Today's Workout</button>
+  <button class="quick-btn" onclick="sendCommand('What is my CF rating')">📈 CF Rating</button>
+  <button class="quick-btn" onclick="sendCommand('What should I upsolve')">🧩 Upsolve List</button>
 </div>
 
 <div class="results-label">RESULTS</div>
@@ -233,7 +285,11 @@ const resultsDiv  = document.getElementById('results');
 // persisted so you don't need the query param on every visit.
 (function () {
   const urlToken = new URLSearchParams(window.location.search).get('token');
-  if (urlToken) localStorage.setItem('jarvisToken', urlToken);
+  if (urlToken) {
+    localStorage.setItem('jarvisToken', urlToken);
+    // Scrub the token out of the address bar / browser history.
+    history.replaceState(null, '', window.location.pathname);
+  }
 })();
 function authedFetch(url, opts) {
   const token = localStorage.getItem('jarvisToken') || '';
@@ -257,6 +313,53 @@ function pollStatus() {
 }
 pollStatus();
 setInterval(pollStatus, 3000);
+
+// ── live status card ──────────────────────────────────────────────────────────
+const infoText = document.getElementById('infoText');
+function pollInfo() {
+  authedFetch('/info')
+    .then(r => r.json())
+    .then(d => {
+      let parts = ['CPU ' + d.cpu + '%'];
+      if (d.battery !== undefined) parts.push('🔋 ' + d.battery + '%' + (d.plugged ? ' ⚡' : ''));
+      if (d.last_action && d.last_action.name)
+        parts.push('Last: ' + d.last_action.name + ' @ ' + d.last_action.time);
+      infoText.textContent = parts.join('  ·  ');
+    })
+    .catch(() => { infoText.textContent = 'status unavailable'; });
+}
+pollInfo();
+setInterval(pollInfo, 10000);
+
+// ── capture to inbox ──────────────────────────────────────────────────────────
+const captureInput = document.getElementById('captureInput');
+async function captureNote(todo) {
+  const text = captureInput.value.trim();
+  if (!text) return;
+  try {
+    const res = await authedFetch('/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, todo })
+    });
+    const data = await res.json();
+    addCard((todo ? 'Task' : 'Note') + ' → inbox', (data.results || [data.error]).join('\\n'), data.status !== 'ok');
+    if (data.status === 'ok') captureInput.value = '';
+  } catch (e) {
+    addCard('Capture', "Can't reach Jarvis — check WiFi.", true);
+  }
+}
+
+// ── find my PC ────────────────────────────────────────────────────────────────
+async function buzzPC() {
+  try {
+    const res = await authedFetch('/buzz', { method: 'POST' });
+    const data = await res.json();
+    addCard('Find My PC', (data.results || ['Buzzing…']).join('\\n'), false);
+  } catch (e) {
+    addCard('Find My PC', "Can't reach Jarvis — check WiFi.", true);
+  }
+}
 
 // ── send command ──────────────────────────────────────────────────────────────
 async function sendCommand(text) {
@@ -358,6 +461,41 @@ def status():
     return jsonify({"status": "online", "jarvis": "ready"})
 
 
+@app.route("/info")
+def info():
+    """Live status card data -- battery, CPU, and the last action Jarvis
+    ran (private actions are already masked in LAST_ACTION)."""
+    import psutil
+    payload = {"cpu": psutil.cpu_percent(interval=None)}
+    battery = psutil.sensors_battery()
+    if battery:
+        payload["battery"] = battery.percent
+        payload["plugged"] = battery.power_plugged
+    payload["last_action"] = jarvis_actions.LAST_ACTION
+    return jsonify(payload)
+
+
+@app.route("/buzz", methods=["POST"])
+def buzz():
+    """Find-my-PC: loud locator beeps."""
+    return jsonify({"status": "ok", "results": [jarvis_actions.buzz_pc()]})
+
+
+@app.route("/capture", methods=["POST"])
+def capture():
+    """Phone capture: appends a note (or todo) straight to the vault
+    inbox -- no intent parsing, no LLM, the text lands verbatim. Same
+    privacy path as voice captures (content redacted from the event
+    log via run_function's PRIVATE_FUNCTIONS)."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"status": "error", "error": "No text provided."}), 400
+    result = jarvis_actions.run_function(
+        "capture_note", {"text": text, "todo": bool(data.get("todo")), "source": "phone"})
+    return jsonify({"status": "ok", "results": [result]})
+
+
 @app.route("/command", methods=["POST"])
 def command():
     data = request.get_json(silent=True) or {}
@@ -375,6 +513,13 @@ def command():
         for action in actions:
             name = action.get("function")
             args = action.get("args", {})
+            if name == "chat":
+                # conversational mode -- answer text comes straight from
+                # the parser, nothing to dispatch
+                reply = (args.get("response") or "").strip()
+                if reply:
+                    results.append(reply)
+                continue
             outcome = jarvis_actions.run_function(name, args)
             results.append(outcome or f"Done: {name}")
 

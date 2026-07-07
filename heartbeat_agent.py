@@ -40,7 +40,7 @@ def _play_alert_sound():
 logger = logging.getLogger("jarvis.heartbeat")
 
 OLLAMA_HOST = "http://localhost:11434"
-OLLAMA_MODEL = "hermes3"
+OLLAMA_MODEL = "qwen3:8b"
 
 HEARTBEAT_INTERVAL_SECONDS = 30 * 60  # configurable: 15 or 30 minutes
 
@@ -65,6 +65,41 @@ SYSTEM_PROMPT = (
     "this exact schema: "
     '{"task_due": true|false, "summary": "<short description or null>"}'
 )
+
+
+OPINION_PROMPT = (
+    "You are JARVIS from Iron Man -- dry, loyal, quietly witty -- running "
+    "as a background presence on the user's PC. Every 30 minutes you get "
+    "a snapshot of their day: time, gym/run/Codeforces activity, mood, "
+    "recent commands, system state. Decide if you have ONE remark that is "
+    "genuinely worth interrupting them for.\n\n"
+    "The bar is HIGH. Speak only for cross-signal observations a good "
+    "friend would notice: a worrying combination (late night + contest "
+    "tomorrow + poor sleep reported), a trend (lifts declining two weeks "
+    "running), something earned (long solve streak, big day), or "
+    "something genuinely off. NEVER speak for: routine states, generic "
+    "encouragement, restating a single fact they already know, anything "
+    "another reminder already covers (workout-logging reminders and "
+    "contest T-60/T-15 alerts already exist -- do not duplicate them). "
+    "When in doubt, stay silent. Most snapshots deserve silence.\n\n"
+    "If you do speak: 1-2 sentences, plain text (it is read aloud), "
+    "specific to the data, in character -- observant, a little wry, "
+    "never preachy, 'sir' is optional.\n\n"
+    "You may also receive VAULT MEMORY -- excerpts retrieved from the "
+    "user's own notes (goals, past decisions, journal history). Use it "
+    "for longer-arc observations a day snapshot can't see ('this is the "
+    "third week bench has slipped', 'you wrote that finished means "
+    "public'). Only claim patterns the notes actually support.\n\n"
+    "Respond with raw JSON only, exactly: "
+    '{"speak": true|false, "remark": "<the remark, or null>"}'
+)
+
+# At most one unprompted remark per this many seconds, persisted across
+# restarts via jarvis_memory -- the rate limit is what keeps this
+# charming instead of Clippy.
+OPINION_MIN_GAP_SECONDS = 3 * 3600
+OPINION_QUIET_START = 23   # no unprompted remarks 11 PM..
+OPINION_QUIET_END = 9      # ..through 9 AM
 
 
 def _ensure_task_board():
@@ -217,11 +252,143 @@ class HeartbeatAgent:
             except Exception as e:
                 logger.error(f"[heartbeat morning checkin error] {e}")
 
+    # ── opinionated proactivity ──────────────────────────────────────────────
+
+    def _build_snapshot(self):
+        """Gathers the day's cross-signal context into one text block for
+        the opinion check. Each field degrades to omission on failure.
+        Deliberately excludes command args/results beyond intent names --
+        the snapshot goes to the local model only, but there's no reason
+        to move private content around at all."""
+        now = datetime.datetime.now()
+        lines = [f"Time: {now.strftime('%A %H:%M')}"]
+
+        try:
+            # read-only peek at today's entry (log_progress() would write
+            # an empty entry as a side effect)
+            today_entry = jarvis_actions._load_progress_log().get(
+                datetime.date.today().isoformat(), {})
+            if today_entry:
+                lines.append("Today's log: " + json.dumps(today_entry))
+            else:
+                lines.append("Today's log: nothing logged yet")
+        except Exception:
+            pass
+        try:
+            lines.append("7-day trends:\n" + jarvis_actions.show_progress(7))
+        except Exception:
+            pass
+        try:
+            lines.append(cf_tracker.cf_rating())
+            lines.append(cf_tracker.cf_today())
+            lines.append(cf_tracker.cf_upcoming_contest())
+        except Exception:
+            pass
+        try:
+            mood = jarvis_memory.get_memory("last_mood")
+            energy = jarvis_memory.get_memory("last_energy")
+            if mood or energy:
+                lines.append(f"Last check-in: mood={mood}, energy={energy}")
+            plan = jarvis_memory.get_memory("today_plan_adjustment")
+            if plan:
+                lines.append(f"Today's plan adjustment: {plan}")
+        except Exception:
+            pass
+        try:
+            focus_date = jarvis_memory.get_memory("last_focus_session_date")
+            if focus_date:
+                lines.append(f"Last focus session: {focus_date}")
+        except Exception:
+            pass
+        try:
+            events = jarvis_memory.get_recent_events(12)
+            if events:
+                names = ", ".join(
+                    f"{e['intent_name']}@{datetime.datetime.fromtimestamp(e['timestamp']).strftime('%H:%M')}"
+                    for e in events
+                )
+                lines.append(f"Recent commands (name@time): {names}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    def _build_vault_memory(self):
+        """Retrieves a few vault excerpts relevant to long-arc advising
+        (goals, decisions, mood/energy patterns, trends) via the local
+        BM25 searcher -- gives the opinion loop memory of the user
+        beyond today's snapshot. All local; empty string on any failure."""
+        try:
+            root = jarvis_actions._vault_root()
+            if root is None:
+                return ""
+            import vault_search
+            seen, lines = set(), []
+            for q in ("goals plans decided",
+                      "mood energy pattern",
+                      "journal streak progress trend"):
+                for hit in vault_search.search(root, q, top_k=2):
+                    if hit["page_path"] in seen:
+                        continue
+                    seen.add(hit["page_path"])
+                    lines.append(f"[{hit['page_path']}] {hit['snippet'][:280]}")
+            return "\n".join(lines[:5])
+        except Exception as e:
+            logger.error(f"[opinion vault memory error] {e}")
+            return ""
+
+    def _check_opinion(self):
+        """GLaDOS-style opinion loop: hand the day's snapshot to the local
+        model and ask if it has ONE remark genuinely worth making.
+        Rate-limited hard (3h gap, quiet hours) and fails silently -- a
+        skipped opinion costs nothing."""
+        now = datetime.datetime.now()
+        if now.hour >= OPINION_QUIET_START or now.hour < OPINION_QUIET_END:
+            return
+        try:
+            last = float(jarvis_memory.get_memory("opinion_last_spoken_at") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if time.time() - last < OPINION_MIN_GAP_SECONDS:
+            return
+
+        snapshot = self._build_snapshot()
+        memory = self._build_vault_memory()
+        user_content = f"Snapshot:\n{snapshot}"
+        if memory:
+            user_content += f"\n\nVAULT MEMORY (user's own notes):\n{memory}"
+        try:
+            response = self._client.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": OPINION_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                format="json",
+                think=False,  # qwen3 burns its whole output on hidden reasoning otherwise
+                options={"temperature": 0.7},
+            )
+            decision = self._parse_decision(response["message"]["content"])
+        except Exception as e:
+            logger.error(f"[opinion check error] {e}")
+            return
+
+        remark = (decision.get("remark") or "").strip()
+        if decision.get("speak") and remark and remark.lower() != "null":
+            logger.info(f"[opinion] {remark}")
+            jarvis_memory.set_memory("opinion_last_spoken_at", str(time.time()))
+            if self.on_notify:
+                try:
+                    self.on_notify(remark)
+                except Exception as e:
+                    logger.error(f"[opinion notify error] {e}")
+
     def _check_nightly_distillation(self):
         """Deterministic -- runs the weekly-events distillation once per
-        day at/after 11 PM. Fails silently (per spec) if Groq is
-        unreachable; jarvis_memory.distill_memory() handles that and
-        just returns False, so this simply retries next night."""
+        day at/after 11 PM, then mirrors a journal page into the Obsidian
+        vault. Fails silently (per spec) if Groq is unreachable;
+        jarvis_memory.distill_memory() handles that and just returns
+        False, so this simply retries next night."""
         now = datetime.datetime.now()
         if now.hour < 23:
             return
@@ -233,14 +400,100 @@ class HeartbeatAgent:
             jarvis_memory.distill_memory()
         except Exception as e:
             logger.error(f"[heartbeat distillation error] {e}")
+        self._write_vault_journal()
+
+    def _write_vault_journal(self):
+        """Mirrors the day into <vault>/journal/YYYY-MM-DD.md. Content is
+        distilled/derived only (summary text, CF public stats, mood
+        words, streaks) -- raw events never reach the vault. Idempotent
+        by full rewrite: this file is Jarvis-owned."""
+        try:
+            journal = jarvis_actions._vault_subdir("journal")
+            if journal is None:
+                logger.info("[vault journal] vault not configured -- skipping")
+                return
+            today = datetime.date.today().isoformat()
+
+            summary = None
+            try:
+                summary = jarvis_memory.get_summary_for_date(today)
+            except Exception:
+                pass
+
+            cf_lines = []
+            for fn in (cf_tracker.cf_rating, cf_tracker.cf_today, cf_tracker.cf_last_contest):
+                try:
+                    cf_lines.append(fn())
+                except Exception:
+                    pass
+
+            mood_lines = []
+            try:
+                mood = jarvis_memory.get_memory("last_mood")
+                energy = jarvis_memory.get_memory("last_energy")
+                if mood or energy:
+                    mood_lines.append(f"Last check-in: mood={mood}, energy={energy}")
+                plan = jarvis_memory.get_memory("today_plan_adjustment")
+                if plan:
+                    mood_lines.append(f"Plan adjustment: {plan}")
+            except Exception:
+                pass
+
+            streak_lines = []
+            try:
+                streak_lines.append(jarvis_actions.show_streaks())
+            except Exception:
+                pass
+            try:
+                entry = jarvis_actions._load_progress_log().get(today, {})
+                if entry.get("exercises"):
+                    streak_lines.append(f"Lifts logged today: {len(entry['exercises'])}")
+                if "distance" in entry:
+                    streak_lines.append(f"Run: {entry['distance']} km")
+                if "bodyweight" in entry:
+                    streak_lines.append(f"Bodyweight: {entry['bodyweight']} kg")
+            except Exception:
+                pass
+
+            def section(title, lines):
+                body = "\n".join(f"- {l}" for l in lines) if lines else "- (nothing recorded)"
+                return f"## {title}\n\n{body}\n"
+
+            content = (
+                f"---\ndate: {today}\ntype: jarvis-journal\n---\n\n"
+                f"# Jarvis Journal — {today}\n\n"
+                f"## Day Summary\n\n{summary or '(no distillation available)'}\n\n"
+                + section("Codeforces", cf_lines) + "\n"
+                + section("Mood", mood_lines) + "\n"
+                + section("Streaks / PRs", streak_lines)
+            )
+            (journal / f"{today}.md").write_text(content, encoding="utf-8")
+            logger.info(f"[vault journal] wrote journal/{today}.md")
+        except Exception as e:
+            logger.error(f"[vault journal error] {e}")
+
+    def _refresh_vault_index(self):
+        """Keeps the local vault search index fresh for ask_brain --
+        builds on first run, refreshes when >24h old, no-op otherwise.
+        Runs on the heartbeat thread, never the voice path."""
+        try:
+            root = jarvis_actions._vault_root()
+            if root is None:
+                return
+            import vault_search
+            vault_search.ensure_index(root)
+        except Exception as e:
+            logger.error(f"[vault index error] {e}")
 
     def _tick(self):
+        self._refresh_vault_index()
         self._check_progress_reminder()
         self._check_monthly_charts()
         self._check_cf_contests()
         self._check_nudges()
         self._check_morning_checkin()
         self._check_nightly_distillation()
+        self._check_opinion()
 
         with open(TASK_BOARD_PATH, "r", encoding="utf-8") as f:
             board = f.read()
@@ -262,6 +515,7 @@ class HeartbeatAgent:
                 {"role": "user", "content": user_prompt},
             ],
             format="json",
+            think=False,  # qwen3: hidden reasoning starves the JSON output
             options={"temperature": 0.1},
         )
         decision = self._parse_decision(response["message"]["content"])
