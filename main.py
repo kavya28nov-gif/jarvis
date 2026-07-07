@@ -522,6 +522,24 @@ class JarvisOrb:
                 parts.append(streaks)
         except Exception:
             pass
+        # vault garnishes: open tasks from today/yesterday + last night's journal
+        try:
+            yesterday = (today - datetime.timedelta(days=1)).isoformat()
+            open_tasks = [
+                jarvis_actions._task_display(t)
+                for path, _, t in jarvis_actions._iter_open_tasks()
+                if path.name in (f"{today.isoformat()}.md", f"{yesterday}.md")
+                or path.name.startswith("cf-")
+            ]
+            if open_tasks:
+                spoken = "; ".join(open_tasks[:3])
+                more = f", and {len(open_tasks) - 3} more" if len(open_tasks) > 3 else ""
+                parts.append(f"{len(open_tasks)} open task(s): {spoken}{more}.")
+            journal = jarvis_actions._vault_subdir("journal")
+            if journal and (journal / f"{yesterday}.md").exists():
+                parts.append("Last night's journal is written.")
+        except Exception:
+            pass
 
         self.root.after(0, lambda: self._set_state("speaking"))
         for part in parts:
@@ -795,7 +813,34 @@ def _run_orb_thread(ready_event, orb_holder):
     orb.root.mainloop()
 
 
+_INSTANCE_LOCK_PORT = 47823
+_instance_lock_socket = None  # module-level so it lives for the process
+
+
+def _acquire_single_instance_lock():
+    """Binds a localhost port as a process-wide mutex -- a second launch
+    fails the bind and exits instead of silently double-running (which
+    splits the mic and the notes between two processes; happened twice)."""
+    global _instance_lock_socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", _INSTANCE_LOCK_PORT))
+        s.listen(1)
+        _instance_lock_socket = s
+        return True
+    except OSError:
+        s.close()
+        return False
+
+
 if __name__ == "__main__":
+    if not _acquire_single_instance_lock():
+        logger.error("Jarvis is already running -- refusing to start a second instance.")
+        ctypes.windll.user32.MessageBoxW(
+            0, "Jarvis is already running.\n(Check the system tray.)",
+            "Jarvis", 0x30)
+        raise SystemExit(1)
+
     from phone_server import start_phone_server
 
     logger.info("Starting Jarvis...")

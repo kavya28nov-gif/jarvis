@@ -383,6 +383,130 @@ class HeartbeatAgent:
                 except Exception as e:
                     logger.error(f"[opinion notify error] {e}")
 
+    def _check_weekly_review(self):
+        """Sunday evening (>=18h): writes journal/week-YYYY-Wnn.md -- a
+        week-in-review over the local data (goals adherence, CF trend,
+        workout adherence, mood arc, aging open tasks), with an optional
+        one-paragraph verdict from the local model. Once per ISO week,
+        guarded via jarvis_memory so restarts don't duplicate it. All
+        data and inference local."""
+        now = datetime.datetime.now()
+        if now.weekday() != 6 or now.hour < 18:   # Sunday evening only
+            return
+        iso_year, iso_week, _ = now.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+        if jarvis_memory.get_memory("last_weekly_review") == week_key:
+            return
+        journal = jarvis_actions._vault_subdir("journal")
+        if journal is None:
+            return
+        jarvis_memory.set_memory("last_weekly_review", week_key)
+
+        today = datetime.date.today()
+        week_dates = [(today - datetime.timedelta(days=i)).isoformat() for i in range(7)]
+
+        # workout adherence vs the 4x/week goal
+        data = {}
+        try:
+            data = jarvis_actions._load_progress_log()
+        except Exception:
+            pass
+        workout_days = sum(
+            1 for d in week_dates
+            if data.get(d, {}).get("exercises") or "distance" in data.get(d, {})
+        )
+        weighins = [(d, data[d]["bodyweight"]) for d in reversed(week_dates)
+                    if "bodyweight" in data.get(d, {})]
+
+        # CF: solves this week + rating
+        cf_lines = []
+        try:
+            conn = cf_tracker._get_db()
+            week_start = int(datetime.datetime.combine(
+                today - datetime.timedelta(days=6), datetime.time.min).timestamp())
+            solved = conn.execute(
+                "SELECT COUNT(*) FROM cf_submissions WHERE solved_at >= ?",
+                (week_start,)).fetchone()[0]
+            conn.close()
+            cf_lines.append(f"Problems solved this week: {solved}")
+            cf_lines.append(cf_tracker.cf_rating())
+        except Exception:
+            pass
+
+        # mood arc from the mood log
+        mood_lines = []
+        try:
+            conn = jarvis_memory._get_db()
+            rows = conn.execute(
+                "SELECT timestamp, energy, mood FROM mood_log WHERE timestamp >= ? ORDER BY timestamp",
+                (int(datetime.datetime.combine(today - datetime.timedelta(days=6),
+                                               datetime.time.min).timestamp()),)).fetchall()
+            conn.close()
+            for r in rows:
+                d = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%a")
+                mood_lines.append(f"{d}: mood={r['mood']}, energy={r['energy']}")
+        except Exception:
+            pass
+
+        # aging open tasks
+        task_lines = []
+        try:
+            for path, _, t in jarvis_actions._iter_open_tasks():
+                task_lines.append(f"{jarvis_actions._task_display(t)} (from {path.stem})")
+        except Exception:
+            pass
+
+        goal_line = (f"Workout days: {workout_days}/7 (goal: 4) -- "
+                     + ("ON TRACK" if workout_days >= 4 else "BEHIND"))
+        weigh_line = (" -> ".join(f"{w}kg" for _, w in weighins)
+                      if weighins else "no weigh-ins logged")
+
+        facts = "\n".join(filter(None, [
+            goal_line,
+            f"Bodyweight: {weigh_line}",
+            *cf_lines,
+            "Mood: " + ("; ".join(mood_lines) if mood_lines else "no check-ins"),
+            f"Open tasks: {len(task_lines)}",
+        ]))
+
+        verdict = ""
+        try:
+            response = self._client.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content":
+                        "You are JARVIS writing a 3-4 sentence week-in-review "
+                        "verdict from the facts given. Direct, specific, dry -- "
+                        "call out what was strong and what slipped vs the "
+                        "4-workouts/week and daily-CF goals. Plain text."},
+                    {"role": "user", "content": facts},
+                ],
+                think=False,
+                options={"temperature": 0.5},
+            )
+            verdict = response["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"[weekly review verdict error] {e}")
+
+        content = (
+            f"---\ndate: {today.isoformat()}\ntype: weekly-review\nweek: {week_key}\n---\n\n"
+            f"# Week in Review — {week_key}\n\n"
+            f"## Adherence\n\n- {goal_line}\n- Bodyweight: {weigh_line}\n\n"
+            f"## Codeforces\n\n" + ("".join(f"- {l}\n" for l in cf_lines) or "- (no data)\n") + "\n"
+            f"## Mood arc\n\n" + ("".join(f"- {l}\n" for l in mood_lines) or "- (no check-ins)\n") + "\n"
+            f"## Open tasks ({len(task_lines)})\n\n"
+            + ("".join(f"- [ ] {l}\n" for l in task_lines[:10]) or "- none\n") + "\n"
+            + (f"## Verdict\n\n{verdict}\n" if verdict else "")
+        )
+        (journal / f"week-{week_key}.md").write_text(content, encoding="utf-8")
+        logger.info(f"[weekly review] wrote journal/week-{week_key}.md")
+        if self.on_notify:
+            try:
+                self.on_notify("Your week in review is written, sir. "
+                               + (f"{workout_days} workout day(s) this week."))
+            except Exception:
+                pass
+
     def _check_nightly_distillation(self):
         """Deterministic -- runs the weekly-events distillation once per
         day at/after 11 PM, then mirrors a journal page into the Obsidian
@@ -493,6 +617,7 @@ class HeartbeatAgent:
         self._check_nudges()
         self._check_morning_checkin()
         self._check_nightly_distillation()
+        self._check_weekly_review()
         self._check_opinion()
 
         with open(TASK_BOARD_PATH, "r", encoding="utf-8") as f:

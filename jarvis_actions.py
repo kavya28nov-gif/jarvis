@@ -196,6 +196,41 @@ def capture_note(text, todo=False, source="voice"):
     return random.choice(_CAPTURE_ACKS)
 
 
+def open_note(name):
+    """Opens a vault note in Obsidian via an obsidian:// URI. Fuzzy
+    match of the spoken name against filenames in wiki/, journal/,
+    inbox/ (read-only listing); speaks which note it chose."""
+    root = _vault_root()
+    if root is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    vault_name = _USER_CONFIG.get("vault_name") or root.name
+
+    name_tokens = set((name or "").lower().replace("-", " ").split())
+    if not name_tokens:
+        return "Which note, sir?"
+
+    best = None  # (score, rel_path_no_ext, display)
+    for sub in ("wiki", "journal", "inbox"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*.md"):
+            stem_words = p.stem.lower().replace("-", " ").replace("_", " ")
+            overlap = sum(1 for t in name_tokens if t in stem_words)
+            score = overlap / len(name_tokens)
+            if score > 0 and (best is None or score > best[0]):
+                rel = p.relative_to(root).with_suffix("").as_posix()
+                best = (score, rel, p.stem)
+
+    if best is None or best[0] < 0.5:
+        return f"No note matching '{name}', sir."
+    _, rel, display = best
+    uri = (f"obsidian://open?vault={urllib.parse.quote(vault_name)}"
+           f"&file={urllib.parse.quote(rel)}")
+    os.startfile(uri)
+    return f"Opening {display}."
+
+
 def dictate_to_note(max_seconds=180):
     """Long-form dictation into a vault DRAFT note (instead of typing
     into the focused window like dictation_mode). Each utterance becomes
@@ -2273,6 +2308,7 @@ FUNCTION_MANIFEST = [
     {"name": "take_screenshot", "description": "Takes a screenshot and saves it.", "args": {}},
     {"name": "ask_brain", "description": "Answers a question from the user's Obsidian notes. Use for 'ask my brain X', 'what do my notes say about X', 'what did I decide about X', 'when did I X'.", "args": {"query": "string, the question"}},
     {"name": "capture_note", "description": "Appends a spoken note to the Obsidian vault inbox. Use for 'note that X', 'remember that X', 'capture X', 'save a note'. Set todo=true for tasks/todos ('add a task to X', 'remind me to X later', 'add X to my list'). NOT for workout weights/run/CF counts -- those go through log_progress.", "args": {"text": "string, the note content", "todo": "bool, true if it's a task"}},
+    {"name": "open_note", "description": "Opens a vault note in Obsidian by fuzzy name. Use for 'open my X note', 'show me the X page'.", "args": {"name": "string, words from the note title"}},
     {"name": "dictate_to_note", "description": "Long-form dictation saved as a vault draft note (NOT typed into a window). Use for 'dictate a note', 'take down a draft', 'dictate into my notes'.", "args": {"max_seconds": "number, optional, default 180"}},
     {"name": "capture_screen_note", "description": "Captures an AI description of the current screen plus an optional spoken comment as one inbox note. Use for 'note what I'm looking at', 'capture this screen with a note'.", "args": {"comment": "string, optional, the user's comment"}},
     {"name": "list_tasks", "description": "Speaks open (unchecked) tasks from the vault. Use for 'what are my tasks', 'what's on my list'.", "args": {}},
