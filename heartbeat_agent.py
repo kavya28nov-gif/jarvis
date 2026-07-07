@@ -492,8 +492,8 @@ class HeartbeatAgent:
             f"---\ndate: {today.isoformat()}\ntype: weekly-review\nweek: {week_key}\n---\n\n"
             f"# Week in Review — {week_key}\n\n"
             f"## Adherence\n\n- {goal_line}\n- Bodyweight: {weigh_line}\n\n"
-            f"## Codeforces\n\n" + ("".join(f"- {l}\n" for l in cf_lines) or "- (no data)\n") + "\n"
-            f"## Mood arc\n\n" + ("".join(f"- {l}\n" for l in mood_lines) or "- (no check-ins)\n") + "\n"
+            "## Codeforces\n\n" + ("".join(f"- {l}\n" for l in cf_lines) or "- (no data)\n") + "\n"
+            "## Mood arc\n\n" + ("".join(f"- {l}\n" for l in mood_lines) or "- (no check-ins)\n") + "\n"
             f"## Open tasks ({len(task_lines)})\n\n"
             + ("".join(f"- [ ] {l}\n" for l in task_lines[:10]) or "- none\n") + "\n"
             + (f"## Verdict\n\n{verdict}\n" if verdict else "")

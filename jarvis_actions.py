@@ -1,6 +1,9 @@
 
 import os
+import re
+import sys
 import ctypes
+import random
 import subprocess
 import webbrowser
 import datetime
@@ -173,7 +176,6 @@ def capture_note(text, todo=False, source="voice"):
     checkbox task instead, completable later via complete_task. Note
     content is NEVER logged to the event DB -- capture_note is in
     PRIVATE_FUNCTIONS."""
-    import random
     inbox = _vault_subdir("inbox")
     if inbox is None:
         return "Vault not configured, sir -- set vault_path in jarvis_config.json."
@@ -290,7 +292,6 @@ def _task_files():
     """Files Jarvis may edit checkboxes in: inbox dailies + CF debriefs.
     NOT the daily journal files (the heartbeat rewrites those nightly,
     which would silently undo a checkbox) and never wiki/."""
-    import re
     files = []
     inbox = _vault_subdir("inbox")
     journal = _vault_subdir("journal")
@@ -306,14 +307,10 @@ def _task_files():
     return files
 
 
-_UNCHECKED_RE = None  # compiled lazily
+_UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.+)$")
 
 
 def _iter_open_tasks():
-    import re
-    global _UNCHECKED_RE
-    if _UNCHECKED_RE is None:
-        _UNCHECKED_RE = re.compile(r"^\s*- \[ \] (.+)$")
     for path in _task_files():
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -327,7 +324,6 @@ def _iter_open_tasks():
 
 def _task_display(raw):
     """Strips the '**HH:MM** (voice) ' capture prefix for speech."""
-    import re
     return re.sub(r"^\*\*\d{2}:\d{2}\*\* \((?:voice|migrated|phone|screen)\) ", "", raw)
 
 
@@ -388,7 +384,6 @@ def _retrieve_vault_chunks(query, top_k=5):
     -- exits 10 unprovisioned, and its bm25 sibling hard-imports fcntl so
     it currently can't run on Windows), then falls back to the local
     pure-Python BM25 searcher. Returns (chunks, source_label)."""
-    import sys
     root = _vault_root()
     script = root / _USER_CONFIG.get("vault_retrieve_script", "scripts/retrieve.py")
     if script.is_file():
@@ -418,7 +413,6 @@ def ask_brain(query):
     since retrieval + local inference can take a while; the rest runs on
     this dispatch thread (already off the UI thread, _busy held), so the
     answer flows back as the normal spoken outcome."""
-    import re as _re
     root = _vault_root()
     if root is None:
         return "Vault not configured, sir -- set vault_path in jarvis_config.json."
@@ -467,7 +461,7 @@ def ask_brain(query):
         )
         resp.raise_for_status()
         answer = resp.json()["message"]["content"]
-        answer = _re.sub(r"<think>.*?</think>", "", answer, flags=_re.S).strip()
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
         return answer or "I don't have that in your notes."
     except Exception as e:
         print(f"[ask_brain] ollama error: {e}")
@@ -1059,14 +1053,6 @@ def log_progress(weights=None, exercises=None, distance=None, run_minutes=None,
     if new_prs:
         msg += " NEW PERSONAL RECORD on " + "; ".join(new_prs) + ". Outstanding, sir!"
     return msg
-
-
-def has_logged_today():
-    """True the moment ANY field is logged for today. Kept for backwards
-    compatibility -- prefer has_logged_weights_today()/has_logged_cf_today()
-    when you need to know specifically which part is still missing."""
-    today = datetime.date.today().isoformat()
-    return today in _load_progress_log()
 
 
 def has_logged_weights_today():

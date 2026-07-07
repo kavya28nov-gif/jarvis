@@ -449,7 +449,6 @@ class JarvisOrb:
         try:
             from openwakeword.model import Model as OWWModel
             import sounddevice as sd
-            import numpy as np
 
             logger.info("Loading wake word model (first run downloads ~5 MB)...")
             oww = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")

@@ -546,8 +546,8 @@ def start_phone_server(port=5000):
     url = f"https://{ip}:{port}/?token={PHONE_SERVER_TOKEN}"
     print(f"\n{'='*46}")
     print(f"  Jarvis Phone Remote → {url}")
-    print(f"  Open that URL in Chrome on your phone")
-    print(f"  (token included -- don't share this link)")
+    print("  Open that URL in Chrome on your phone")
+    print("  (token included -- don't share this link)")
     print(f"{'='*46}\n")
 
     thread = threading.Thread(
