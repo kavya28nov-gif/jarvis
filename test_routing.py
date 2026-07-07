@@ -21,9 +21,19 @@ import jarvis_actions
 
 def test_easter_eggs_route_locally():
     for phrase, fn in [
+        # with the jarvis prefix (typed / phone)
         ("jarvis rumble", "easter_rumble"),
         ("Jarvis, I am inevitable!", "easter_inevitable"),
         ("jarvis i choose you", "easter_pokemon"),
+        # WITHOUT the prefix -- how it actually arrives after the wake
+        # word (regression caught live 2026-07-07: "I used to be you")
+        ("I used to be you.", "easter_rick"),
+        ("Rumble", "easter_rumble"),
+        ("on your left", "easter_on_your_left"),
+        ("This is the way.", "easter_mandalorian"),
+        ("people die when they are killed", "easter_shirou"),
+        # whisper adds punctuation and stray spaces
+        ("  Go beyond!  ", "easter_mha"),
     ]:
         result = intent_parser.parse_command(phrase)
         assert result["actions"][0]["function"] == fn, phrase

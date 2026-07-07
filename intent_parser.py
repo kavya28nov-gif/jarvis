@@ -48,7 +48,18 @@ EXACT_PHRASE_TRIGGERS = {
 
 
 def _normalize(text):
-    return "".join(c for c in text.lower() if c.isalnum() or c == " ").strip()
+    return " ".join("".join(c for c in text.lower() if c.isalnum() or c == " ").split())
+
+
+def _match_exact_trigger(text):
+    """Easter-egg lookup. The wake word already contains 'Jarvis', so
+    users say 'I used to be you', not 'jarvis i used to be you' -- match
+    both forms (learned from a live miss on 2026-07-07)."""
+    norm = _normalize(text)
+    hit = EXACT_PHRASE_TRIGGERS.get(norm)
+    if hit:
+        return hit
+    return EXACT_PHRASE_TRIGGERS.get("jarvis " + norm)
 
 
 # "note that I benched 80" should be a log_progress call, not an inbox
@@ -130,7 +141,7 @@ def parse_command(user_text, history=None):
         raise RuntimeError("GROQ_API_KEY environment variable is not set.")
 
     # zero-token path for exact-phrase triggers (easter eggs)
-    egg = EXACT_PHRASE_TRIGGERS.get(_normalize(user_text))
+    egg = _match_exact_trigger(user_text)
     if egg:
         return {"actions": [{"function": egg, "args": {}}]}
 
