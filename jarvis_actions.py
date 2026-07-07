@@ -41,6 +41,7 @@ from cf_tracker import (
     cf_upsolve, cf_drill, build_cf_monthly_payload,
 )
 from jarvis_memory import check_in, memory_summary, whats_my_plan, last_time
+from emotion import how_do_you_feel, what_do_you_want
 from easter_eggs import (
     easter_dont_leave, easter_rumble, easter_inevitable, easter_rick,
     easter_on_your_left, easter_evangelion, easter_mandalorian, easter_shirou,
@@ -2294,6 +2295,8 @@ FUNCTION_MANIFEST = [
     {"name": "take_screenshot", "description": "Takes a screenshot and saves it.", "args": {}},
     {"name": "ask_brain", "description": "Answers a question from the user's Obsidian notes. Use for 'ask my brain X', 'what do my notes say about X', 'what did I decide about X', 'when did I X'.", "args": {"query": "string, the question"}},
     {"name": "capture_note", "description": "Appends a spoken note to the Obsidian vault inbox. Use for 'note that X', 'remember that X', 'capture X', 'save a note'. Set todo=true for tasks/todos ('add a task to X', 'remind me to X later', 'add X to my list'). NOT for workout weights/run/CF counts -- those go through log_progress.", "args": {"text": "string, the note content", "todo": "bool, true if it's a task"}},
+    {"name": "how_do_you_feel", "description": "Jarvis reports its own computed emotional state with reasons. Use for 'how are you feeling', 'how do you feel', 'what's your mood'.", "args": {}},
+    {"name": "what_do_you_want", "description": "Jarvis reports its current cravings/drives. Use for 'what do you want', 'what do you crave', 'what do you need'.", "args": {}},
     {"name": "open_note", "description": "Opens a vault note in Obsidian by fuzzy name. Use for 'open my X note', 'show me the X page'.", "args": {"name": "string, words from the note title"}},
     {"name": "dictate_to_note", "description": "Long-form dictation saved as a vault draft note (NOT typed into a window). Use for 'dictate a note', 'take down a draft', 'dictate into my notes'.", "args": {"max_seconds": "number, optional, default 180"}},
     {"name": "capture_screen_note", "description": "Captures an AI description of the current screen plus an optional spoken comment as one inbox note. Use for 'note what I'm looking at', 'capture this screen with a note'.", "args": {"comment": "string, optional, the user's comment"}},
@@ -2421,6 +2424,16 @@ def run_function(name, args=None):
         "result": "[private]" if name in PRIVATE_FUNCTIONS else str(result)[:200],
         "time": datetime.datetime.now().strftime("%H:%M"),
     })
+
+    # Affect: every dispatched event nudges the emotional state (see
+    # emotion.py). Expression-only; failures must never touch dispatch.
+    # Note: appraise() sees only the function NAME and result string --
+    # private capture content stays out of the affect layer too.
+    try:
+        import emotion
+        emotion.appraise(name, None, "" if name in PRIVATE_FUNCTIONS else result)
+    except Exception:
+        pass
 
     # Event logging wraps the dispatcher -- every call gets recorded for
     # the memory layer. Failure here must never break the actual

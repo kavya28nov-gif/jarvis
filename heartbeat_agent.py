@@ -90,6 +90,10 @@ OPINION_PROMPT = (
     "for longer-arc observations a day snapshot can't see ('this is the "
     "third week bench has slipped', 'you wrote that finished means "
     "public'). Only claim patterns the notes actually support.\n\n"
+    "You may receive YOUR OWN STATE (disposition + a craving). Let the "
+    "disposition color your tone. If a craving is high you may voice it "
+    "once, briefly and wistfully ('the inbox has been quiet, sir') -- "
+    "NEVER as guilt, leverage, or a condition for helping.\n\n"
     "Respond with raw JSON only, exactly: "
     '{"speak": true|false, "remark": "<the remark, or null>"}'
 )
@@ -358,6 +362,16 @@ class HeartbeatAgent:
         if memory:
             user_content += f"\n\nVAULT MEMORY (user's own notes):\n{memory}"
         try:
+            import emotion
+            st = emotion.load_state()
+            drive, val = emotion.top_drive(st)
+            state_line = f"disposition: {emotion.disposition(st)}"
+            if val > 0.7:
+                state_line += f"; craving: {drive} ({val:.1f})"
+            user_content += f"\n\nYOUR OWN STATE: {state_line}"
+        except Exception:
+            pass
+        try:
             response = self._client.chat(
                 model=OLLAMA_MODEL,
                 messages=[
@@ -609,7 +623,40 @@ class HeartbeatAgent:
         except Exception as e:
             logger.error(f"[vault index error] {e}")
 
+    def _tick_emotion(self):
+        """Feeds world state into the affect layer's drives -- open task
+        pressure (order), days without logged progress (growth), and
+        sympathy for a fresh rough mood. Expression-only downstream."""
+        try:
+            import emotion
+            open_tasks, oldest_days = 0, 0
+            try:
+                today = datetime.date.today()
+                for path, _, _ in jarvis_actions._iter_open_tasks():
+                    open_tasks += 1
+                    try:
+                        d = datetime.date.fromisoformat(path.stem[:10])
+                        oldest_days = max(oldest_days, (today - d).days)
+                    except ValueError:
+                        pass
+            except Exception:
+                pass
+            days_since = None
+            try:
+                data = jarvis_actions._load_progress_log()
+                if data:
+                    last = max(datetime.date.fromisoformat(d) for d in data)
+                    days_since = (datetime.date.today() - last).days
+            except Exception:
+                pass
+            mood, _ = jarvis_memory.get_fresh_mood()
+            emotion.tick(open_tasks=open_tasks, oldest_task_days=oldest_days,
+                         days_since_progress=days_since, user_mood=mood)
+        except Exception as e:
+            logger.error(f"[emotion tick error] {e}")
+
     def _tick(self):
+        self._tick_emotion()
         self._refresh_vault_index()
         self._check_progress_reminder()
         self._check_monthly_charts()

@@ -124,6 +124,14 @@ def _system_prompt():
             )
     except Exception:
         pass
+    # Jarvis's own computed disposition (emotion.py) colors chat tone --
+    # worn lightly, never announced unless directly asked.
+    try:
+        import emotion
+        prompt += (f"\n\nYour own disposition right now: {emotion.disposition()}. "
+                   "Let it subtly color your tone; never mention it unasked.")
+    except Exception:
+        pass
     return prompt + "\n\n" + build_prompt_snippet()
 
 

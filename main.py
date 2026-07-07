@@ -175,6 +175,10 @@ class JarvisOrb:
         self._spotify_cooldown_until = 0.0
         self._tts_playing = False
         self._last_briefing_date = None
+        # cached affect state (emotion.py) -- refreshed lazily, drives
+        # subtle TTS and idle-orb expression without a DB hit per frame
+        self._affect = {"valence": 0.0, "arousal": 0.35}
+        self._affect_read_at = 0.0
 
         # Easter-egg orb controls -- additive on top of the existing
         # state machine, never touches orb_renderer's projection/particle
@@ -286,6 +290,19 @@ class JarvisOrb:
                 self._audio_peak = 0.0
             time.sleep(0.1)
 
+    def _affect_state(self):
+        """Cached read of the computed emotional state (refreshes every
+        60s) -- keeps affect expression off the DB hot path."""
+        if time.time() - self._affect_read_at > 60:
+            self._affect_read_at = time.time()
+            try:
+                import emotion
+                st = emotion.load_state()
+                self._affect = {"valence": st["valence"], "arousal": st["arousal"]}
+            except Exception:
+                pass
+        return self._affect
+
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self):
@@ -318,8 +335,12 @@ class JarvisOrb:
         if not self._frozen:
             if self.state == "custom":
                 step = 0.02 * self._pulse_speed_mult
+            elif self.state == "idle":
+                # idle breathing tracks Jarvis's own arousal -- a calm
+                # orb rests slower, an agitated one paces (±30%)
+                step = 0.014 * (0.7 + 0.6 * self._affect_state()["arousal"])
             else:
-                step = 0.014 if self.state == "idle" else 0.032
+                step = 0.032
             self._phase = (self._phase + step) % 1.0
         self._draw()
         self.root.after(FRAME_MS, self._animate)
@@ -736,6 +757,14 @@ class JarvisOrb:
                 if mood == "rough":
                     mood_rate -= 5
                     mood_vol_scale = 0.85
+            except Exception:
+                pass
+            # Jarvis's OWN state nudges delivery too (±5%) -- spirited
+            # days sound a touch quicker, subdued days a touch slower.
+            # The user's mood always outweighs it (above).
+            try:
+                affect = self._affect_state()
+                mood_rate += int(5 * affect["valence"])
             except Exception:
                 pass
             rate = f"{max(-50, min(50, jarvis_actions.VOICE_RATE + mood_rate)):+d}%"
