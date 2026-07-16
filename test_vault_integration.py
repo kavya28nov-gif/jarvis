@@ -334,7 +334,7 @@ def test_named_metric_and_bodyweight(temp_progress_log):
 
 
 def test_bodyweight_series_in_show_progress(temp_progress_log):
-    import datetime as dt, json
+    import datetime as dt
     today = dt.date.today()
     data = {
         (today - dt.timedelta(days=2)).isoformat(): {"exercises": {}, "bodyweight": 79.0},
@@ -347,7 +347,6 @@ def test_bodyweight_series_in_show_progress(temp_progress_log):
 
 
 def test_journal_includes_bodyweight(temp_vault, temp_progress_log):
-    import datetime as dt
     jarvis_actions.log_progress(bodyweight=78.2)
     import heartbeat_agent
     heartbeat_agent.HeartbeatAgent()._write_vault_journal()
@@ -432,3 +431,102 @@ def test_cf_debrief_note(temp_vault):
     assert content.count("- [ ] Upsolve") == 2
     assert "https://codeforces.com/contest/999/problem/C" in content
     assert "Solved: A, B" in content
+
+
+# ── Devil's advocate: _find_contradictions ───────────────────────────────────
+
+@pytest.fixture
+def contradiction_vault(temp_vault, monkeypatch):
+    """Temp vault holding a fresh journal entry that contradicts an old
+    wiki belief, with the search-index cache isolated from the real one."""
+    import pathlib
+    import vault_search
+    monkeypatch.setattr(vault_search, "INDEX_PATH",
+                        pathlib.Path(temp_vault) / "test_index.json")
+    wiki = os.path.join(temp_vault, "wiki")
+    os.makedirs(wiki)
+    with open(os.path.join(wiki, "Beliefs.md"), "w", encoding="utf-8") as f:
+        f.write("---\ntype: concept\n---\n\nThe fitness tracker ships when "
+                "it is public. Finished means public, always.\n")
+    journal = os.path.join(temp_vault, "journal")
+    os.makedirs(journal)
+    with open(os.path.join(journal, f"{TODAY}.md"), "w", encoding="utf-8") as f:
+        f.write(f"---\ndate: {TODAY}\n---\n\nCalled the fitness tracker "
+                "done today. Repo stays private for now, maybe forever.\n")
+    return temp_vault
+
+
+@pytest.fixture
+def fake_seen_store(monkeypatch):
+    """In-memory stand-in for jarvis_memory's key-value store so the seen
+    hashes never touch the real DB."""
+    store = {}
+    monkeypatch.setattr(jarvis_memory, "get_memory",
+                        lambda k, default=None: store.get(k, default))
+    monkeypatch.setattr(jarvis_memory, "set_memory",
+                        lambda k, v: store.__setitem__(k, str(v)))
+    return store
+
+
+def _fake_llm(findings):
+    import json as _json
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": _json.dumps({"findings": findings})}}
+
+    return lambda *a, **k: _Resp()
+
+
+_CANNED = [{
+    "earlier": "Finished means public, always.",
+    "later": "Repo stays private for now, maybe forever.",
+    "say": "You wrote that finished means public, but today's entry calls "
+           "the tracker done with the repo private -- still the rule?",
+}]
+
+
+def test_contradiction_hash_survives_repunctuation():
+    h1 = jarvis_actions._contradiction_hash("Finished means public!", "repo stays private")
+    h2 = jarvis_actions._contradiction_hash("finished MEANS public", "Repo, stays private.")
+    assert h1 == h2
+    h3 = jarvis_actions._contradiction_hash("something else", "repo stays private")
+    assert h1 != h3
+
+
+def test_find_contradictions_surfaces_once(contradiction_vault, fake_seen_store, monkeypatch):
+    monkeypatch.setattr(jarvis_actions.requests, "post", _fake_llm(_CANNED))
+    findings = jarvis_actions._find_contradictions()
+    assert len(findings) == 1
+    assert "finished means public" in findings[0].lower()
+    # the exact same tension must never be re-nagged
+    assert jarvis_actions._find_contradictions() == []
+
+
+def test_find_contradictions_mark_seen_false_does_not_persist(
+        contradiction_vault, fake_seen_store, monkeypatch):
+    monkeypatch.setattr(jarvis_actions.requests, "post", _fake_llm(_CANNED))
+    assert len(jarvis_actions._find_contradictions(mark_seen=False)) == 1
+    assert len(jarvis_actions._find_contradictions()) == 1  # still unseen
+
+
+def test_find_contradictions_empty_findings_honored(
+        contradiction_vault, fake_seen_store, monkeypatch):
+    monkeypatch.setattr(jarvis_actions.requests, "post", _fake_llm([]))
+    assert jarvis_actions._find_contradictions() == []
+
+
+def test_find_contradictions_no_recent_entries(temp_vault, fake_seen_store):
+    # empty vault -> nothing to compare, no LLM call needed
+    assert jarvis_actions._find_contradictions() == []
+
+
+def test_check_contradictions_ollama_down(contradiction_vault, fake_seen_store, monkeypatch):
+    def _boom(*a, **k):
+        raise ConnectionError("ollama down")
+    monkeypatch.setattr(jarvis_actions.requests, "post", _boom)
+    assert jarvis_actions._find_contradictions() is None
+    assert "local model" in jarvis_actions.check_contradictions()

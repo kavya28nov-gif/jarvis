@@ -539,6 +539,36 @@ class HeartbeatAgent:
         except Exception as e:
             logger.error(f"[heartbeat distillation error] {e}")
         self._write_vault_journal()
+        self._check_contradictions()
+
+    def _check_contradictions(self):
+        """Devil's advocate pass, opt-in via contradiction_checks in
+        jarvis_config.json. Piggybacks on the nightly 11 PM distillation
+        (already once-a-day guarded) rather than owning a timer. Reads
+        the vault, never writes it: retrieval + local qwen3 live in
+        jarvis_actions._find_contradictions, shared with the on-demand
+        voice command. Findings arrive via on_notify like _check_opinion
+        -- an observation, not a verdict -- and each tension surfaces at
+        most once ever (snippet-hash set persisted in jarvis_memory)."""
+        if not jarvis_actions._USER_CONFIG.get("contradiction_checks", False):
+            return
+        self._set_state("background_processing")
+        try:
+            findings = jarvis_actions._find_contradictions()
+        except Exception as e:
+            logger.error(f"[contradiction check error] {e}")
+            findings = None
+        finally:
+            self._set_state("idle")
+        if not findings:
+            return
+        remark = " ".join(findings)
+        logger.info(f"[contradictions] {remark}")
+        if self.on_notify:
+            try:
+                self.on_notify(remark)
+            except Exception as e:
+                logger.error(f"[contradiction notify error] {e}")
 
     def _write_vault_journal(self):
         """Mirrors the day into <vault>/journal/YYYY-MM-DD.md. Content is

@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import ctypes
+import hashlib
 import random
 import subprocess
 import webbrowser
@@ -67,6 +68,7 @@ from easter_eggs import (
 
 SPEAK_FN = None         # set to JarvisOrb._speak
 ORB_CONTROLLER = None   # set to JarvisOrb.orb_controller
+GESTURE_EYES = None     # set to JarvisOrb.gesture_eyes (gesture_eyes.GestureEyes)
 
 # Voice output settings, read by main._speak on every utterance.
 WHISPER_MODE = False                # manual quiet-mode toggle
@@ -467,6 +469,208 @@ def ask_brain(query):
     except Exception as e:
         print(f"[ask_brain] ollama error: {e}")
         return "I couldn't reach the local model, sir -- is Ollama running?"
+
+
+# ---------------------------------------------------------------------------
+# Devil's advocate -- contradiction surfacing over the vault. Read-only:
+# this feature NEVER writes the vault (no new files, no wiki/ edits); the
+# only state it keeps is a seen-hash list in jarvis_memory.
+# ---------------------------------------------------------------------------
+
+_DEVILS_ADVOCATE_PROMPT = (
+    "You are JARVIS quietly playing devil's advocate over the user's own "
+    "notes. You get RECENT notes (last 7 days) and OLDER notes retrieved "
+    "for the same topics. Find at most 2 genuine tensions: a stated "
+    "belief, plan, or claim that a later entry contradicts or silently "
+    "abandons, or a commitment asserted once and never revisited.\n\n"
+    "The bar is HIGH. Both sides must be specific and quotable from the "
+    "notes given. If there is no real contradiction, return zero findings "
+    "-- do NOT manufacture tension, do NOT pad with vague 'have you "
+    "considered' advice. Empty is the expected answer most nights.\n\n"
+    "Tone: a neutral observation between equals -- curious, never "
+    "moralizing. Each 'say' is ONE sentence, spoken aloud, naming both "
+    "sides with their dates or note names in plain speech (no markdown, "
+    "no [[links]]), ending with a light question. Example: 'You wrote in "
+    "March that finished means public, but Tuesday's entry calls the "
+    "tracker done with the repo still private -- still the rule?'\n\n"
+    "Respond with raw JSON only, exactly: "
+    '{"findings": [{"earlier": "<short verbatim quote>", '
+    '"later": "<short verbatim quote>", "say": "<one spoken sentence>"}]}'
+)
+
+# Tokens too generic to steer BM25 toward a topic (plus the vault's own
+# furniture words that appear in every Jarvis-written journal page).
+_CONTRA_STOPWORDS = {
+    "the", "and", "that", "this", "with", "for", "was", "are", "but",
+    "not", "you", "your", "have", "has", "had", "just", "about", "from",
+    "they", "them", "then", "than", "there", "here", "what", "when",
+    "how", "why", "did", "does", "will", "would", "should", "could",
+    "into", "over", "under", "again", "more", "less", "very", "still",
+    "today", "yesterday", "tomorrow", "day", "week", "month",
+    "jarvis", "journal", "note", "notes", "entry", "logged", "recorded",
+    "summary", "nothing", "none",
+}
+
+_SEEN_CONTRADICTIONS_KEY = "seen_contradictions"
+_SEEN_CONTRADICTIONS_CAP = 200
+
+
+def _contradiction_hash(earlier, later):
+    """Stable id for a tension: both verbatim quotes, normalized to bare
+    alphanumerics so re-punctuation between runs doesn't defeat dedupe."""
+    def norm(s):
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    return hashlib.sha1(f"{norm(earlier)}|{norm(later)}".encode()).hexdigest()[:16]
+
+
+def _recent_vault_entries(root, days=7, per_entry_chars=400):
+    """(date, rel_path, text) for date-stamped journal/ and inbox/ pages
+    from the last `days` days -- direct file reads, no BM25 needed since
+    the filenames ARE the dates."""
+    import vault_search
+    out = []
+    today = datetime.date.today()
+    for kind in ("journal", "inbox"):
+        d = _vault_subdir(kind)
+        if d is None or not d.is_dir():
+            continue
+        for i in range(days):
+            day = (today - datetime.timedelta(days=i)).isoformat()
+            p = d / f"{day}.md"
+            if not p.exists():
+                continue
+            try:
+                text = vault_search._strip_frontmatter(
+                    p.read_text(encoding="utf-8", errors="ignore")).strip()
+            except OSError:
+                continue
+            if text:
+                out.append((day, f"{d.name}/{p.name}", text[:per_entry_chars]))
+    return out
+
+
+def _contra_key_terms(texts, root, top_n=10):
+    """Most topic-bearing tokens of the recent entries, weighted by
+    count x BM25 idf from the existing vault index -- so the retrieval
+    query favors 'bench'/'tracker' over words every page shares."""
+    import math
+    import vault_search
+    index = vault_search.ensure_index(root)
+    n, df = max(index["n"], 1), index["df"]
+    counts = {}
+    for t in vault_search._tokenize(" ".join(texts)):
+        if len(t) < 3 or t in _CONTRA_STOPWORDS:
+            continue
+        counts[t] = counts.get(t, 0) + 1
+    scored = sorted(
+        (c * math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)), t)
+        for t, c in counts.items() if t in df
+    )
+    return [t for _, t in scored[-top_n:]]
+
+
+def _find_contradictions(mark_seen=True):
+    """Shared core for the nightly heartbeat pass and the on-demand voice
+    command. Returns a list of speakable finding sentences ([] when the
+    notes are consistent or there's nothing to compare), or None when the
+    local model call failed. Already-surfaced tensions (hash of the two
+    quoted snippets, persisted in jarvis_memory) are filtered out so the
+    same one is never re-nagged."""
+    root = _vault_root()
+    if root is None:
+        return []
+    recent = _recent_vault_entries(root)
+    if not recent:
+        return []
+
+    import vault_search
+    older = []
+    terms = _contra_key_terms([t for _, _, t in recent], root)
+    if terms:
+        recent_paths = {p for _, p, _ in recent}
+        for hit in vault_search.search(root, " ".join(terms), top_k=10):
+            if hit["page_path"] not in recent_paths:
+                older.append(hit)
+            if len(older) >= 5:
+                break
+    if not older:
+        return []
+
+    recent_block = "\n\n".join(f"[{p} — {d}]\n{t}" for d, p, t in recent)
+    older_block = "\n\n".join(
+        f"[{h['page_path']}]\n{h['snippet'][:300]}" for h in older)
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/chat",
+            json={
+                "model": "qwen3:8b",
+                "stream": False,
+                "think": False,  # qwen3: hidden reasoning starves the JSON output
+                "format": "json",
+                "messages": [
+                    {"role": "system", "content": _DEVILS_ADVOCATE_PROMPT},
+                    {"role": "user", "content":
+                        f"RECENT NOTES (last 7 days):\n{recent_block}\n\n"
+                        f"OLDER NOTES (same topics):\n{older_block}"},
+                ],
+                "options": {"temperature": 0.3, "num_predict": 300},
+                "keep_alive": "30m",
+            },
+            timeout=240,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"]
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+        findings = json.loads(raw).get("findings") or []
+    except Exception as e:
+        print(f"[contradictions] error: {e}")
+        return None
+
+    import jarvis_memory
+    try:
+        seen_list = json.loads(
+            jarvis_memory.get_memory(_SEEN_CONTRADICTIONS_KEY) or "[]")
+    except (TypeError, ValueError):
+        seen_list = []
+    seen = set(seen_list)
+
+    out, new_hashes = [], []
+    for f in findings[:2]:
+        if not isinstance(f, dict):
+            continue
+        say = (f.get("say") or "").strip()
+        h = _contradiction_hash(f.get("earlier"), f.get("later"))
+        if say and h not in seen:
+            out.append(say)
+            new_hashes.append(h)
+    if mark_seen and new_hashes:
+        try:
+            jarvis_memory.set_memory(
+                _SEEN_CONTRADICTIONS_KEY,
+                json.dumps((seen_list + new_hashes)[-_SEEN_CONTRADICTIONS_CAP:]))
+        except Exception as e:
+            print(f"[contradictions] seen-set persist error: {e}")
+    return out
+
+
+def check_contradictions():
+    """Voice-invoked devil's advocate pass. In PRIVATE_FUNCTIONS: the
+    result quotes journal content, which must never reach the event DB
+    (it feeds the Groq distillation)."""
+    root = _vault_root()
+    if root is None:
+        return "Vault not configured, sir -- set vault_path in jarvis_config.json."
+    if SPEAK_FN:
+        try:
+            SPEAK_FN("Playing devil's advocate against your notes. Give me a minute.")
+        except Exception:
+            pass
+    findings = _find_contradictions()
+    if findings is None:
+        return "I couldn't reach the local model, sir -- is Ollama running?"
+    if not findings:
+        return "Nothing stood out, sir."
+    return " ".join(findings)
 
 
 # Merge user overrides from jarvis_config.json over the defaults above.
@@ -1431,6 +1635,25 @@ def media_previous():
     return "Went to previous track."
 
 
+# ---------------------------------------------------------------------------
+# Gesture control (webcam "eyes" -- see gesture_eyes.py)
+# ---------------------------------------------------------------------------
+
+def eyes_on():
+    """Starts the webcam gesture watcher. GESTURE_EYES is injected by
+    main.py at boot; headless users (phone server, tests) get a polite
+    refusal instead of a crash."""
+    if GESTURE_EYES is None:
+        return "My eyes aren't wired up in this session, sir."
+    return GESTURE_EYES.start()
+
+
+def eyes_off():
+    if GESTURE_EYES is None:
+        return "My eyes aren't wired up in this session, sir."
+    return GESTURE_EYES.stop()
+
+
 _youtube_queue = []
 _youtube_queue_index = -1
 
@@ -2333,6 +2556,7 @@ FUNCTION_MANIFEST = [
     {"name": "end_demon_mode", "description": "Ends demon mode -- eyes close, orb returns. Use for 'end demon mode', 'stop watching me', 'release me'.", "args": {}},
     {"name": "check_in", "description": "Triggers the mood/energy check-in flow -- Jarvis asks about energy, mood, and soreness/injuries via voice, then speaks an adjusted plan for today. Use this whenever the user says things like 'check in', 'how am I doing', or asks about their energy/mood.", "args": {}},
     {"name": "memory_summary", "description": "Speaks today's distilled memory summary (generated nightly at 11 PM from the past week's activity).", "args": {}},
+    {"name": "check_contradictions", "description": "Reviews recent journal/notes for contradictions or stale claims and reports findings.", "args": {}},
     {"name": "whats_my_plan", "description": "Reads today's plan adjustment (from the last mood check-in), whether today is a workout day, and the next upcoming CF contest.", "args": {}},
     {"name": "last_time", "description": "Looks up the last time the user asked about or did something related to a topic, e.g. 'last time I asked about Spotify'.", "args": {"topic": "string, the topic/keyword to search for"}},
     # NOTE: easter eggs are intentionally NOT in this manifest -- they're
@@ -2341,6 +2565,8 @@ FUNCTION_MANIFEST = [
     # importable above for FUNCTION_REGISTRY-free dispatch paths.
     {"name": "set_timer", "description": "Sets a timer/reminder that pops up an alert when done.", "args": {"minutes": "number", "label": "string, optional"}},
     {"name": "media_play_pause", "description": "Toggles play/pause on the active media player (e.g. Spotify).", "args": {}},
+    {"name": "eyes_on", "description": "Turns on gesture control -- the webcam reads hand gestures to control media, tabs and windows.", "args": {}},
+    {"name": "eyes_off", "description": "Turns off gesture control and releases the webcam.", "args": {}},
     {"name": "media_next", "description": "Skips to the next track.", "args": {}},
     {"name": "media_previous", "description": "Goes to the previous track.", "args": {}},
     {"name": "ask_ai", "description": "Delegates a work task to an LLM (e.g. PPT outline, code, writing) via Groq and opens the result.", "args": {"task": "string, full task description"}},
@@ -2401,7 +2627,7 @@ PRIVATE_FUNCTIONS = {
     "read_clipboard", "summarize_clipboard", "translate_clipboard",
     "save_note", "send_whatsapp", "draft_email", "ask_ai",
     "solve_from_screenshot", "translate", "capture_note",
-    "dictate_to_note", "capture_screen_note",
+    "dictate_to_note", "capture_screen_note", "check_contradictions",
 }
 
 

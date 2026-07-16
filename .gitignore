@@ -31,3 +31,6 @@ Thumbs.db
 
 # Render preview artifact -- regenerable
 orb_preview.png
+
+# MediaPipe gesture model -- auto-downloaded by gesture_eyes.py on first run
+assets/gesture_recognizer.task

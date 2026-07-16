@@ -43,6 +43,7 @@ from PIL import ImageTk
 
 import intent_parser
 import jarvis_actions
+import gesture_eyes
 import voice_input
 import heartbeat_agent
 import tray_icon
@@ -237,6 +238,15 @@ class JarvisOrb:
         # (24h) from the 30-min heartbeat, per the CF tracker spec.
         cf_tracker.start_daily_fetch_thread()
 
+        # Eyes: webcam gesture control (gesture_eyes.py). All processing
+        # is local; frames never persist. "gesture_control": false in
+        # jarvis_config.json keeps the camera off at boot; voice can
+        # toggle it either way ("eyes on"/"eyes off").
+        self.gesture_eyes = gesture_eyes.GestureEyes(on_action=self._on_gesture_action)
+        jarvis_actions.GESTURE_EYES = self.gesture_eyes
+        if jarvis_actions._USER_CONFIG.get("gesture_control", True):
+            logger.info(self.gesture_eyes.start())
+
     # ── boot / ambient extras ─────────────────────────────────────────────────
 
     def _boot_sequence(self):
@@ -406,6 +416,28 @@ class JarvisOrb:
         self._speak(text)
         self.root.after(0, lambda: self._set_state("idle"))
 
+    def _on_gesture_action(self, label, rgb):
+        """Called from the gesture-eyes camera thread each time a hand
+        gesture fires -- flashes the orb in the gesture's color as a
+        silent acknowledgement. Skipped whenever anything else owns the
+        orb (voice flow, easter egg, heartbeat state), since restoring
+        from "custom" mid-interaction would yank the state to idle."""
+        logger.info(f"[gesture] {label}")
+        if self._busy or self.state != "idle":
+            return
+
+        def _flash():
+            if self._busy or self.state != "idle":
+                return
+            self._set_custom_color(*rgb)
+
+            def _unflash():
+                if self.state == "custom" and not self._busy:
+                    self._restore_from_easter_egg()
+            self.root.after(700, _unflash)
+
+        self.root.after(0, _flash)
+
     def _on_checkin_trigger(self):
         """Called from the heartbeat thread (a proactive nudge or the
         9 AM auto-trigger) to start the mood/energy check-in flow. Runs
@@ -441,6 +473,7 @@ class JarvisOrb:
     def shutdown(self):
         logger.info("Shutting down Jarvis...")
         self._wake_active = False
+        self.gesture_eyes.stop()
         self.heartbeat.stop()
         self.root.after(0, self.root.destroy)
 

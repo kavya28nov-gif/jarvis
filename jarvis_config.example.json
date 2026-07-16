@@ -16,6 +16,8 @@
   "vault_journal": "journal",
   "vault_name": "your-vault-name",
   "vault_retrieve_script": "scripts/retrieve.py",
+  "gesture_control": true,
+  "contradiction_checks": false,
   "routines": {
     "good night": ["whisper mode on", "mute", "lock the screen"],
     "work mode": ["open codeforces", "start focus session for 45 minutes"]
