@@ -540,6 +540,34 @@ class HeartbeatAgent:
             logger.error(f"[heartbeat distillation error] {e}")
         self._write_vault_journal()
         self._check_contradictions()
+        self._check_roast()
+
+    def _check_roast(self):
+        """Roast mode, opt-in via roast_mode in jarvis_config.json. Once a
+        night, piggybacking on the 11 PM distillation guard, Jarvis reads
+        the same local-only day snapshot the opinion loop uses and delivers
+        one roast about the day's behavior. Generation lives in
+        jarvis_actions._generate_roast, shared with the on-demand 'roast
+        me' voice command; failures are silent -- a missed roast is not a
+        problem worth an error sound."""
+        if not jarvis_actions._USER_CONFIG.get("roast_mode", False):
+            return
+        self._set_state("background_processing")
+        try:
+            roast = jarvis_actions._generate_roast(self._build_snapshot())
+        except Exception as e:
+            logger.error(f"[roast error] {e}")
+            roast = None
+        finally:
+            self._set_state("idle")
+        if not roast:
+            return
+        logger.info(f"[roast] {roast}")
+        if self.on_notify:
+            try:
+                self.on_notify(f"Tonight's roast, sir: {roast}")
+            except Exception as e:
+                logger.error(f"[roast notify error] {e}")
 
     def _check_contradictions(self):
         """Devil's advocate pass, opt-in via contradiction_checks in

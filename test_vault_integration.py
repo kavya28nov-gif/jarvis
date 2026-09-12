@@ -530,3 +530,58 @@ def test_check_contradictions_ollama_down(contradiction_vault, fake_seen_store, 
     monkeypatch.setattr(jarvis_actions.requests, "post", _boom)
     assert jarvis_actions._find_contradictions() is None
     assert "local model" in jarvis_actions.check_contradictions()
+
+
+# ── Roast mode: _generate_roast / roast_me ───────────────────────────────────
+
+def _fake_roast_llm(payload):
+    import json as _json
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": _json.dumps(payload)}}
+
+    return lambda *a, **k: _Resp()
+
+
+def test_generate_roast_returns_line(monkeypatch):
+    monkeypatch.setattr(jarvis_actions.requests, "post", _fake_roast_llm(
+        {"roast": "Eleven Spotify commands, zero focus sessions. Bold strategy, sir."}))
+    roast = jarvis_actions._generate_roast("Recent commands: play_music x11")
+    assert "Bold strategy" in roast
+
+
+def test_generate_roast_empty_and_error(monkeypatch):
+    monkeypatch.setattr(jarvis_actions.requests, "post", _fake_roast_llm({"roast": ""}))
+    assert jarvis_actions._generate_roast("snapshot") is None
+
+    def _boom(*a, **k):
+        raise ConnectionError("ollama down")
+    monkeypatch.setattr(jarvis_actions.requests, "post", _boom)
+    assert jarvis_actions._generate_roast("snapshot") is None
+    assert "local model" in jarvis_actions.roast_me()
+
+
+def test_roast_me_registered_and_private():
+    assert "roast_me" in jarvis_actions.FUNCTION_REGISTRY
+    assert "roast_me" in jarvis_actions.PRIVATE_FUNCTIONS
+
+
+def test_nightly_roast_respects_config(monkeypatch):
+    import heartbeat_agent
+    monkeypatch.setitem(jarvis_actions._USER_CONFIG, "roast_mode", False)
+    calls = []
+    monkeypatch.setattr(jarvis_actions, "_generate_roast",
+                        lambda snap: calls.append(snap) or "roasted")
+    agent = heartbeat_agent.HeartbeatAgent(on_notify=calls.append)
+    agent._check_roast()
+    assert calls == []
+
+    monkeypatch.setitem(jarvis_actions._USER_CONFIG, "roast_mode", True)
+    monkeypatch.setattr(heartbeat_agent.HeartbeatAgent, "_build_snapshot",
+                        lambda self: "the snapshot")
+    agent._check_roast()
+    assert calls == ["the snapshot", "Tonight's roast, sir: roasted"]

@@ -28,6 +28,10 @@ Thumbs.db
 # Local dev-tool config -- not project source, not meant to be public
 .claude/
 .idea/
+CLAUDE.md
+
+# Personal splash screen (contains real names) -- not meant to be public
+_intro_preview.html
 
 # Render preview artifact -- regenerable
 orb_preview.png

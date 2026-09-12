@@ -206,7 +206,89 @@ def distill_memory():
     conn.commit()
     conn.close()
     logger.info(f"[memory] distilled summary stored for {today}")
+
+    # Reflection rides the same once-nightly guard: failures here must
+    # never break the distillation result.
+    try:
+        reflect_into_core_memory()
+    except Exception as e:
+        logger.error(f"[memory] reflection failed: {e}")
     return True
+
+
+REFLECT_PROMPT = (
+    "You review two weeks of assistant-usage events to find DURABLE "
+    "behavioral patterns about the user. Propose at most 2 NEW facts, "
+    "each supported by several events (e.g. 'user consistently skips "
+    "Friday gym', 'user does CF drills late at night'). Never speculate "
+    "about mood or feelings. Never repeat or rephrase a known fact. "
+    'Reply ONLY with JSON: {"facts": [{"subject": "<short topic key>", '
+    '"fact": "<one sentence>"}]} -- an empty list is a good answer. '
+    "The subject names WHAT the fact is about ('gym schedule', "
+    "'note-taking hours'), never a generic word like 'user'."
+)
+
+
+def reflect_into_core_memory():
+    """Sleep-time reflection (the Letta idea): once a night, look at the
+    last two weeks of events next to the facts already known, and let
+    the LLM promote recurring patterns into core memory. Hard-capped at
+    2 facts per night, marked source='reflection' so list_facts shows
+    them as '(observed)' -- always askable, never sneaky."""
+    if not GROQ_API_KEY:
+        return False
+    events = get_events_last_days(14)
+    if len(events) < 20:
+        return False  # not enough signal to call anything a pattern
+
+    import core_memory
+    known = core_memory.core_block() or "(none yet)"
+    raw = json.dumps(
+        [{"t": datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%a %H:%M"),
+          "intent": r["intent_name"], "outcome": str(r["outcome"])[:120]}
+         for r in events],
+        default=str,
+    )[:8000]
+
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_DISTILL_MODEL,
+                "messages": [
+                    {"role": "system", "content": REFLECT_PROMPT},
+                    {"role": "user",
+                     "content": f"Known facts:\n{known}\n\nEvents:\n{raw}"},
+                ],
+                "max_tokens": 300,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        proposed = json.loads(response.json()["choices"][0]["message"]["content"])
+    except Exception as e:
+        logger.error(f"[memory] reflection call failed: {e}")
+        return False
+
+    added = 0
+    used_subjects = set()
+    for f in (proposed.get("facts") or [])[:2]:
+        subject = str(f.get("subject") or "").strip().lower()
+        fact = str(f.get("fact") or "").strip()
+        if not fact:
+            continue
+        # Guard against generic/colliding subjects (a live run produced
+        # subject='user' for both facts, which would make the second
+        # silently supersede the first): fall back to a slug of the fact.
+        if subject in {"", "user", "the user", "me"} or subject in used_subjects:
+            subject = core_memory._slug(fact, max_words=5)
+        used_subjects.add(subject)
+        out = core_memory.remember_fact(fact, subject=subject, source="reflection")
+        logger.info(f"[memory] reflection: {out}")
+        added += 1
+    return added > 0
 
 
 def get_fresh_mood(max_age_hours=18):
@@ -253,6 +335,15 @@ def build_memory_block():
     conn.close()
 
     lines = ["[JARVIS MEMORY]"]
+    # Core memory first: durable self-curated facts must survive the
+    # truncation below, so they go ahead of the day's ephemera.
+    try:
+        import core_memory
+        core = core_memory.core_block()
+        if core:
+            lines.append(core)
+    except Exception:
+        pass
     if summary_row:
         lines.append(f"Today's context: {summary_row['summary_text']}")
     if recent:

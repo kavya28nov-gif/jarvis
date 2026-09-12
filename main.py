@@ -148,7 +148,7 @@ class JarvisOrb:
         self.root.wm_attributes("-transparentcolor", MAGIC_BG_HEX)
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        # Cap the orb so it always fits on screen
+        # Cadp the orb so it always fits on screen
         actual = min(SIZE, sw - 48, sh - 80)
         x = max(0, sw - actual - 24)
         y = max(0, sh - actual - 60)
@@ -157,7 +157,7 @@ class JarvisOrb:
         self.canvas = tk.Canvas(
             self.root, width=actual, height=actual,
             bg=MAGIC_BG_HEX, highlightthickness=0
-        )
+        )   
         self.canvas.pack()
 
         self._renderer = OrbRenderer(size=actual)

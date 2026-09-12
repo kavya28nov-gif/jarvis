@@ -127,6 +127,18 @@ def init_db():
         analyzed_at INTEGER
     );
     """)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS cf_duels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contest_id INTEGER,
+        problem_index TEXT,
+        problem_name TEXT,
+        rating INTEGER,
+        started_at INTEGER,
+        deadline INTEGER,
+        result TEXT DEFAULT 'pending'
+    );
+    """)
     # attempted_unsolved: added later for upsolve tracking -- ALTER fails
     # harmlessly if the column already exists.
     try:
@@ -286,6 +298,13 @@ def run_heartbeat_check(on_notify=None, play_alert=None):
     (c) analyze any tracked contest that's now FINISHED and not yet
         analyzed
     """
+    # duels first -- a restart orphans the watcher thread, this settles
+    # any duel whose clock ran out while nobody was watching
+    try:
+        _settle_expired_duels(on_notify)
+    except Exception as e:
+        logger.error(f"[cf duel settle error] {e}")
+
     contests = _rate_limited_get("contest.list", {"gym": "false"})
     if not contests:
         return
@@ -517,15 +536,16 @@ def cf_upsolve():
     return "Upsolve targets: " + "; ".join(pending) + "."
 
 
-def cf_drill(offset=100):
-    """Practice drill: picks a random unsolved problem rated about
-    `offset` above your current rating (public CF problemset API, same
-    surface as the rest of the tracker) and opens it."""
+def _pick_unsolved(offset=100, tag=None):
+    """Random unsolved problem rated within 100 of (current rating +
+    offset), optionally restricted to one tag. Returns the problem dict
+    or an error string -- shared by cf_drill and cf_duel."""
     import random as _random
     rating = get_current_rating()
     if rating is None:
         rating = 1200  # sensible default until the first rating fetch
     target = rating + int(offset)
+    tag = (tag or "").strip().lower() or None
 
     problems = _rate_limited_get("problemset.problems")
     if not problems:
@@ -541,15 +561,265 @@ def cf_drill(offset=100):
         if p.get("rating") is not None
         and abs(p["rating"] - target) <= 100
         and (p.get("contestId"), p.get("index")) not in solved
+        and (tag is None or tag in [t.lower() for t in p.get("tags", [])])
     ]
     if not candidates:
-        return f"No unsolved problems found around rating {target}."
+        where = f" tagged '{tag}'" if tag else ""
+        return f"No unsolved problems{where} found around rating {target}."
+    return _random.choice(candidates)
 
-    pick = _random.choice(candidates)
+
+def cf_drill(offset=100, tag=None):
+    """Practice drill: picks a random unsolved problem rated about
+    `offset` above your current rating (public CF problemset API, same
+    surface as the rest of the tracker) and opens it. Optional `tag`
+    restricts to one problem tag (e.g. 'dp', 'graphs') -- pairs with
+    cf_weakness for targeted practice, the TLE-bot recommendation idea."""
+    pick = _pick_unsolved(offset, tag)
+    if isinstance(pick, str):
+        return pick
     url = f"https://codeforces.com/problemset/problem/{pick['contestId']}/{pick['index']}"
     webbrowser.open(url)
-    return (f"Drill time: {pick['name']}, rated {pick['rating']}. "
+    tag_note = f" A {(tag or '').strip().lower()} problem, as prescribed." if tag else ""
+    return (f"Drill time: {pick['name']}, rated {pick['rating']}.{tag_note} "
             f"It's open -- clock's running, sir.")
+
+
+# The mainstream tags that matter for rating growth -- niche tags
+# (chinese remainder theorem, schedules...) would drown the analysis.
+CORE_TAGS = [
+    "implementation", "math", "greedy", "dp", "data structures",
+    "brute force", "constructive algorithms", "graphs", "sortings",
+    "binary search", "dfs and similar", "trees", "strings",
+    "number theory", "combinatorics", "two pointers", "bitmasks",
+]
+
+
+def cf_weakness():
+    """Weak-tag analysis (the TLE bot's recommendation idea): counts your
+    ACs per mainstream tag and, for practiced tags, the hardest rating
+    you've cleared. The least-practiced tags are your weak spots --
+    'drill me on <tag>' turns the diagnosis into practice."""
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT tags, rating FROM cf_submissions WHERE tags IS NOT NULL"
+    ).fetchall()
+    conn.close()
+
+    if len(rows) < 10:
+        return ("Not enough solve history for a weakness read yet, sir -- "
+                "keep solving, the tracker is watching.")
+
+    counts = {t: 0 for t in CORE_TAGS}
+    max_rating = {}
+    for r in rows:
+        try:
+            tags = [t.lower() for t in json.loads(r["tags"] or "[]")]
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for t in tags:
+            if t in counts:
+                counts[t] += 1
+                if r["rating"]:
+                    max_rating[t] = max(max_rating.get(t, 0), r["rating"])
+
+    weakest = sorted(CORE_TAGS, key=lambda t: (counts[t], max_rating.get(t, 0)))[:3]
+    strongest = max(CORE_TAGS, key=lambda t: counts[t])
+
+    def _desc(t):
+        n = counts[t]
+        if n == 0:
+            return f"{t} (untouched)"
+        return f"{t} ({n} solve{'s' if n != 1 else ''}, best {max_rating.get(t, '?')})"
+
+    return (f"Weak spots, sir: {', '.join(_desc(t) for t in weakest)}. "
+            f"Strongest: {strongest} with {counts[strongest]} solves. "
+            f"Say 'drill me on {weakest[0]}' and we fix the first one.")
+
+
+# ---------------------------------------------------------------------------
+# Duel mode -- a timed race against the clock (the TLE bot's duel idea,
+# solo edition). Jarvis picks the problem, starts the clock, polls the
+# public API for your AC, and announces the verdict aloud.
+# ---------------------------------------------------------------------------
+
+DUEL_POLL_SECONDS = 60
+
+
+def _duel_speak(msg):
+    """Announce through the live TTS when available (lazy import, same
+    pattern as _write_debrief_note); silently drops when headless."""
+    try:
+        import jarvis_actions
+        if jarvis_actions.SPEAK_FN:
+            jarvis_actions.SPEAK_FN(msg)
+    except Exception:
+        pass
+
+
+def _duel_appraise(name):
+    """Duel outcomes move the affect layer directly -- run_function's
+    hook can't see them because they land from the watcher thread."""
+    try:
+        import emotion
+        emotion.appraise(name, None, "")
+    except Exception:
+        pass
+
+
+def _get_pending_duel(conn):
+    # cf_tracker only runs init_db() at app startup; guard the duel table
+    # for standalone/headless callers hitting a pre-duel DB.
+    conn.execute("""CREATE TABLE IF NOT EXISTS cf_duels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contest_id INTEGER, problem_index TEXT, problem_name TEXT,
+        rating INTEGER, started_at INTEGER, deadline INTEGER,
+        result TEXT DEFAULT 'pending')""")
+    return conn.execute(
+        "SELECT * FROM cf_duels WHERE result='pending' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+
+
+def _duel_ac_time(duel):
+    """First AC timestamp for the duel problem after the duel started,
+    or None. One user.status call -- cheap and rate-limited like all
+    other API traffic here."""
+    handle = _get_cf_handle()
+    if not handle:
+        return None
+    subs = _rate_limited_get("user.status", {"handle": handle, "from": 1, "count": 25})
+    for sub in subs or []:
+        p = sub.get("problem", {})
+        if (sub.get("verdict") == "OK"
+                and p.get("contestId") == duel["contest_id"]
+                and p.get("index") == duel["problem_index"]
+                and sub.get("creationTimeSeconds", 0) >= duel["started_at"]):
+            return sub["creationTimeSeconds"]
+    return None
+
+
+def _settle_duel(duel_id, result):
+    conn = _get_db()
+    conn.execute("UPDATE cf_duels SET result=? WHERE id=? AND result='pending'",
+                 (result, duel_id))
+    changed = conn.total_changes > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def _duel_watch(duel_id):
+    """Watcher thread: polls once a minute until AC or deadline. Daemon,
+    dies with the process -- the heartbeat settles orphaned duels after
+    a restart (see _settle_expired_duels)."""
+    while True:
+        conn = _get_db()
+        duel = conn.execute("SELECT * FROM cf_duels WHERE id=?", (duel_id,)).fetchone()
+        conn.close()
+        if not duel or duel["result"] != "pending":
+            return  # surrendered or settled elsewhere
+
+        now = int(time.time())
+        ac_at = _duel_ac_time(duel)
+        if ac_at is not None and ac_at <= duel["deadline"]:
+            if _settle_duel(duel_id, "won"):
+                mins = max(1, (ac_at - duel["started_at"]) // 60)
+                _duel_appraise("cf_duel_won")
+                _duel_speak(f"Accepted, sir. {duel['problem_name']} down in {mins} "
+                            "minutes. Duel won.")
+            return
+        if now >= duel["deadline"]:
+            if _settle_duel(duel_id, "lost"):
+                _duel_appraise("cf_duel_lost")
+                _duel_speak(f"Time, sir. {duel['problem_name']} stands unsolved. "
+                            "The clock takes this one -- upsolve it and we call it even.")
+            return
+        time.sleep(min(DUEL_POLL_SECONDS, max(5, duel["deadline"] - now)))
+
+
+def _settle_expired_duels(on_notify=None):
+    """Heartbeat backstop: a restart kills the watcher thread, so any
+    pending duel past its deadline gets one final verdict check here."""
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT * FROM cf_duels WHERE result='pending' AND deadline < ?",
+        (int(time.time()),),
+    ).fetchall()
+    conn.close()
+    for duel in rows:
+        ac_at = _duel_ac_time(duel)
+        won = ac_at is not None and ac_at <= duel["deadline"]
+        if _settle_duel(duel["id"], "won" if won else "lost") and on_notify:
+            verdict = "you solved it in time -- duel won" if won else "unsolved -- duel lost"
+            on_notify(f"Settling an interrupted duel on {duel['problem_name']}: {verdict}.")
+
+
+def cf_duel(minutes=30, tag=None):
+    """Starts a duel: an unsolved problem AT your current rating (no
+    offset -- duels are meant to be winnable), a deadline, and a watcher
+    that announces the verdict the moment you AC or the clock runs out."""
+    conn = _get_db()
+    pending = _get_pending_duel(conn)
+    conn.close()
+    if pending:
+        left = max(0, pending["deadline"] - int(time.time())) // 60
+        return (f"A duel is already running, sir: {pending['problem_name']}, "
+                f"{left} minutes left. Finish it or surrender.")
+
+    if not _get_cf_handle():
+        return "No cf_handle in jarvis_config.json, sir -- I can't verify your solves."
+
+    pick = _pick_unsolved(offset=0, tag=tag)
+    if isinstance(pick, str):
+        return pick
+
+    minutes = max(5, int(minutes))
+    now = int(time.time())
+    conn = _get_db()
+    cur = conn.execute(
+        "INSERT INTO cf_duels (contest_id, problem_index, problem_name, rating, "
+        "started_at, deadline) VALUES (?, ?, ?, ?, ?, ?)",
+        (pick["contestId"], pick["index"], pick["name"], pick["rating"],
+         now, now + minutes * 60),
+    )
+    duel_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    webbrowser.open(
+        f"https://codeforces.com/problemset/problem/{pick['contestId']}/{pick['index']}")
+    threading.Thread(target=_duel_watch, args=(duel_id,), daemon=True,
+                     name=f"cf-duel-{duel_id}").start()
+    return (f"Duel accepted: {pick['name']}, rated {pick['rating']}, "
+            f"{minutes} minutes on the clock. It's open. I'm watching the judge, sir.")
+
+
+def cf_duel_status():
+    conn = _get_db()
+    duel = _get_pending_duel(conn)
+    last = conn.execute(
+        "SELECT * FROM cf_duels WHERE result != 'pending' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if duel:
+        left = max(0, duel["deadline"] - int(time.time()))
+        return (f"Duel in progress: {duel['problem_name']}, rated {duel['rating']}. "
+                f"{left // 60}m {left % 60}s remaining, sir.")
+    if last:
+        return f"No duel running. Last duel ({last['problem_name']}): {last['result']}."
+    return "No duel on record, sir. Say 'duel me' and pick your poison."
+
+
+def cf_surrender():
+    conn = _get_db()
+    duel = _get_pending_duel(conn)
+    conn.close()
+    if not duel:
+        return "Nothing to surrender, sir -- no duel is running."
+    _settle_duel(duel["id"], "surrendered")
+    _duel_appraise("cf_duel_lost")
+    return (f"Duel conceded on {duel['problem_name']}. "
+            "It goes on the upsolve list, not the trophy shelf.")
 
 
 def seconds_until_next_contest():

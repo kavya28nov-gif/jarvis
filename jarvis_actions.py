@@ -39,9 +39,11 @@ load_dotenv()
 # pattern as every other manifest entry in this file.
 from cf_tracker import (
     cf_rating, cf_today, cf_last_contest, cf_monthly_summary, cf_upcoming_contest,
-    cf_upsolve, cf_drill, build_cf_monthly_payload,
+    cf_upsolve, cf_drill, cf_weakness, cf_duel, cf_duel_status, cf_surrender,
+    build_cf_monthly_payload,
 )
 from jarvis_memory import check_in, memory_summary, whats_my_plan, last_time
+from core_memory import remember_fact, forget_fact, list_facts, fact_history
 from emotion import how_do_you_feel, what_do_you_want
 from easter_eggs import (
     easter_dont_leave, easter_rumble, easter_inevitable, easter_rick,
@@ -671,6 +673,77 @@ def check_contradictions():
     if not findings:
         return "Nothing stood out, sir."
     return " ".join(findings)
+
+
+# ---------------------------------------------------------------------------
+# Roast mode -- one savage-but-affectionate line about the day's activity.
+# Runs on local qwen3 only: the day snapshot (workout log, CF activity,
+# mood, command names/times) is the same local-only data the opinion loop
+# uses, and none of it should ride to a cloud API just for a joke.
+# ---------------------------------------------------------------------------
+
+_ROAST_PROMPT = (
+    "You are JARVIS, roasting your own user at the end of their day -- "
+    "dry, savage, affectionate underneath. You get a snapshot of the day: "
+    "workouts logged (or conspicuously not), Codeforces activity, focus "
+    "sessions, and what commands they gave you at what times.\n\n"
+    "Deliver EXACTLY ONE roast: 1-2 sentences, plain text, spoken aloud. "
+    "It must be grounded in the data -- name the specific embarrassing "
+    "fact (skipped the gym again, asked you for music eleven times but "
+    "never started a focus session, still issuing commands at 2 AM). "
+    "Wit over cruelty: a butler who has seen too much, not an edgelord.\n\n"
+    "Rules: roast BEHAVIOR, never feelings -- a low mood or low energy "
+    "in a check-in is off-limits as ammunition. No advice, no moral, no "
+    "'but seriously'. If the day was genuinely productive, roast them "
+    "for being insufferable about it instead.\n\n"
+    'Respond with raw JSON only, exactly: {"roast": "<the roast>"}'
+)
+
+
+def _generate_roast(snapshot):
+    """Shared core for the nightly roast and the on-demand voice command.
+    Returns the roast line, or None when the local model call failed."""
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/chat",
+            json={
+                "model": "qwen3:8b",
+                "stream": False,
+                "think": False,  # qwen3: hidden reasoning starves the JSON output
+                "format": "json",
+                "messages": [
+                    {"role": "system", "content": _ROAST_PROMPT},
+                    {"role": "user", "content": f"Today's snapshot:\n{snapshot}"},
+                ],
+                "options": {"temperature": 0.9, "num_predict": 150},
+                "keep_alive": "30m",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"]
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+        return (json.loads(raw).get("roast") or "").strip() or None
+    except Exception as e:
+        print(f"[roast] error: {e}")
+        return None
+
+
+def roast_me():
+    """Voice-invoked roast. In PRIVATE_FUNCTIONS: the result quotes the
+    day snapshot, which must never reach the event DB (it feeds the Groq
+    distillation)."""
+    import heartbeat_agent
+    if SPEAK_FN:
+        try:
+            SPEAK_FN("With pleasure, sir. Reviewing the evidence.")
+        except Exception:
+            pass
+    snapshot = heartbeat_agent.HeartbeatAgent()._build_snapshot()
+    roast = _generate_roast(snapshot)
+    if roast is None:
+        return "I couldn't reach the local model, sir -- is Ollama running?"
+    return roast
 
 
 # Merge user overrides from jarvis_config.json over the defaults above.
@@ -2269,6 +2342,121 @@ def ask_ai(task):
     return f"Got a response. Saved and opened: {path}"
 
 
+def _council_local_seat(prompt):
+    """One council seat: local qwen3 via Ollama, same call shape as
+    ask_brain. Returns the answer text or None on any failure."""
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/chat",
+            json={
+                "model": "qwen3:8b",
+                "stream": False,
+                "think": False,  # qwen3: hidden reasoning starves the output
+                "messages": [
+                    {"role": "system",
+                     "content": "Answer directly in under 80 words. Plain text only."},
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {"temperature": 0.4, "num_predict": 160},
+                "keep_alive": "30m",
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["message"]["content"]
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
+        return answer or None
+    except Exception as e:
+        print(f"[council] local seat failed: {e}")
+        return None
+
+
+def _council_cloud_seat(prompt):
+    text, _err = _call_groq(
+        [{"role": "system",
+          "content": "Answer directly in under 80 words. Plain text only."},
+         {"role": "user", "content": prompt}],
+        model=GROQ_TEXT_MODEL, max_tokens=200)
+    return text
+
+
+def _rebuttal_prompt(question, own, other):
+    return (f"Question: {question}\n\nYour earlier answer: {own}\n\n"
+            f"Another expert answered: {other}\n\n"
+            "In under 60 words, give your FINAL answer. Name any real "
+            "disagreement with the other expert; change your mind only "
+            "if their argument is genuinely better.")
+
+
+def council(question):
+    """Second-opinion machine (the multi-model arena / group-chat idea,
+    sized for the two brains Jarvis already has), now a real debate:
+
+      Round 1 -- local qwen3 and Groq's Llama answer blind, in parallel.
+      Round 2 -- each seat sees the other's answer and gives a final
+                 (possibly revised) position, in parallel.
+      Judge   -- rules on the finals: consensus stated as consensus,
+                 disagreement surfaced instead of papered over.
+
+    Degrades gracefully: one seat missing skips the debate, a failed
+    rebuttal falls back to that seat's round-1 answer."""
+    if SPEAK_FN:
+        try:
+            SPEAK_FN("Convening the council, sir. A moment.")
+        except Exception:
+            pass
+
+    def _parallel(local_prompt, cloud_prompt):
+        out = {}
+        threads = [
+            threading.Thread(
+                target=lambda: out.update(local=_council_local_seat(local_prompt)),
+                daemon=True),
+            threading.Thread(
+                target=lambda: out.update(cloud=_council_cloud_seat(cloud_prompt)),
+                daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=125)
+        return out.get("local"), out.get("cloud")
+
+    # round 1: blind answers
+    local_1, cloud_1 = _parallel(question, question)
+    if not local_1 and not cloud_1:
+        return "The council chamber is empty, sir -- neither model answered. Is Ollama running?"
+    if not local_1 or not cloud_1:
+        name, ans = ("cloud llama", cloud_1) if cloud_1 else ("local qwen3", local_1)
+        return f"Only one counsel answered ({name}), so no debate: {ans}"
+
+    # round 2: each seat sees the other's answer and finalizes
+    local_2, cloud_2 = _parallel(
+        _rebuttal_prompt(question, local_1, cloud_1),
+        _rebuttal_prompt(question, cloud_1, local_1),
+    )
+    local_final = local_2 or local_1
+    cloud_final = cloud_2 or cloud_1
+
+    verdict, err = _call_groq(
+        [{"role": "system", "content": (
+            "You are the judge of a two-model debate. You see each side's "
+            "final position after they read each other's first answers. If "
+            "they converged, state the consensus in one or two sentences. "
+            "If they still disagree, say exactly where, which side you'd "
+            "trust and why. Spoken aloud: plain text, under 70 words.")},
+         {"role": "user", "content": (
+             f"Question: {question}\n\n"
+             f"Counsel A final (local qwen3): {local_final}\n\n"
+             f"Counsel B final (cloud llama): {cloud_final}")}],
+        model=GROQ_TEXT_MODEL, max_tokens=220)
+    if verdict:
+        return f"Council verdict: {verdict}"
+    # judge unavailable -- read out both finals briefly rather than fail
+    return ("The judge is out, sir, so raw counsel. Qwen says: "
+            f"{local_final[:150]} -- Llama says: {cloud_final[:150]}")
+
+
 def solve_from_screenshot(prompt="Solve this problem and explain your reasoning."):
     """Takes a screenshot of the current screen and sends it to a Groq
     vision model (e.g. for a coding/math problem visible on screen)."""
@@ -2547,7 +2735,11 @@ FUNCTION_MANIFEST = [
     {"name": "run_diagnostics", "description": "Self-test of all subsystems (mic, speaker, Groq, Ollama, Spotify, Codeforces API) and reports what's broken. Use for 'run diagnostics' or 'system check'.", "args": {}},
     {"name": "run_routine", "description": "Runs a user-defined multi-step routine from jarvis_config.json by name. Use when the user says a routine name like 'good night' or 'run my morning routine'.", "args": {"name": "string, routine name"}},
     {"name": "show_streaks", "description": "Reports the current CF solve day-streak and gym day-streak. Use for 'what's my streak'.", "args": {}},
-    {"name": "cf_drill", "description": "Practice drill -- opens a random unsolved Codeforces problem rated ~offset above the user's rating. Use for 'give me a problem', 'drill me', 'practice problem'.", "args": {"offset": "int, optional, rating points above current, default 100"}},
+    {"name": "cf_drill", "description": "Practice drill -- opens a random unsolved Codeforces problem rated ~offset above the user's rating. Use for 'give me a problem', 'drill me'. 'drill me on dp' -> tag='dp'.", "args": {"offset": "int, optional, default 100", "tag": "string, optional, CF tag like dp, graphs"}},
+    {"name": "cf_weakness", "description": "Finds the user's weakest Codeforces tags from solve history. Use for 'weak topics', 'where am I weak', 'what should I practice'.", "args": {}},
+    {"name": "cf_duel", "description": "Timed race: opens an unsolved CF problem at the user's rating and watches the judge -- announces win or loss when they AC or time runs out. 'duel me for 30 minutes'.", "args": {"minutes": "int, default 30", "tag": "string, optional"}},
+    {"name": "cf_duel_status", "description": "Time left and target of the current duel.", "args": {}},
+    {"name": "cf_surrender", "description": "Concede the running duel. 'I give up', 'surrender'.", "args": {}},
     {"name": "dictation_mode", "description": "Types whatever the user speaks into the focused window until they say 'stop dictation'. Use for 'take dictation' or 'type what I say'.", "args": {"max_seconds": "number, optional, default 120"}},
     {"name": "minimize_windows", "description": "Minimizes all windows to show the desktop. Use for 'clear my screen', 'minimize everything', 'show desktop'.", "args": {}},
     {"name": "describe_screen", "description": "Speaks a 2-sentence summary of what's currently visible on screen. Use for 'what's on my screen', 'describe my screen'.", "args": {}},
@@ -2556,7 +2748,13 @@ FUNCTION_MANIFEST = [
     {"name": "end_demon_mode", "description": "Ends demon mode -- eyes close, orb returns. Use for 'end demon mode', 'stop watching me', 'release me'.", "args": {}},
     {"name": "check_in", "description": "Triggers the mood/energy check-in flow -- Jarvis asks about energy, mood, and soreness/injuries via voice, then speaks an adjusted plan for today. Use this whenever the user says things like 'check in', 'how am I doing', or asks about their energy/mood.", "args": {}},
     {"name": "memory_summary", "description": "Speaks today's distilled memory summary (generated nightly at 11 PM from the past week's activity).", "args": {}},
+    {"name": "remember_fact", "description": "Stores a DURABLE personal fact in long-term memory ('my bench PR is 85', 'exam is August 3rd'). Same subject later = replaces the old value.", "args": {"fact": "string, full sentence", "subject": "string, short stable key like 'bench pr'"}},
+    {"name": "forget_fact", "description": "Drops matching facts from long-term memory. Use for 'forget what I said about X'.", "args": {"subject": "string"}},
+    {"name": "list_facts", "description": "Speaks all remembered facts. Use for 'what do you know about me', 'list your memory'.", "args": {}},
+    {"name": "fact_history", "description": "Past values of a remembered fact with dates -- 'when did X change', 'what was my bench PR before'.", "args": {"subject": "string"}},
+    {"name": "council", "description": "Asks local and cloud models the same question in parallel, then judges them into one verdict. Use for 'second opinion on X', 'ask the council', 'debate X'.", "args": {"question": "string"}},
     {"name": "check_contradictions", "description": "Reviews recent journal/notes for contradictions or stale claims and reports findings.", "args": {}},
+    {"name": "roast_me", "description": "Delivers one savage roast of the user grounded in today's actual activity. Use for 'roast me', 'insult me', 'humble me', 'destroy me'.", "args": {}},
     {"name": "whats_my_plan", "description": "Reads today's plan adjustment (from the last mood check-in), whether today is a workout day, and the next upcoming CF contest.", "args": {}},
     {"name": "last_time", "description": "Looks up the last time the user asked about or did something related to a topic, e.g. 'last time I asked about Spotify'.", "args": {"topic": "string, the topic/keyword to search for"}},
     # NOTE: easter eggs are intentionally NOT in this manifest -- they're
@@ -2628,6 +2826,7 @@ PRIVATE_FUNCTIONS = {
     "save_note", "send_whatsapp", "draft_email", "ask_ai",
     "solve_from_screenshot", "translate", "capture_note",
     "dictate_to_note", "capture_screen_note", "check_contradictions",
+    "roast_me",
 }
 
 

@@ -89,27 +89,84 @@ def _preroute_metrics(text):
         return rest
     return text
 
-BASE_PROMPT = (
-    "You are Jarvis, a local desktop voice assistant in the style of "
-    "JARVIS from Iron Man. Read the user's request and decide which of "
-    "the available functions (if any) should be called to satisfy it. "
-    "A single request can map to several actions in sequence -- include "
-    "all of them in order.\n\n"
-    "CONVERSATIONAL MODE: if the request is NOT a command but a "
-    "question, opinion, or casual conversation (e.g. 'is quicksort "
-    "faster than mergesort', 'should I do the contest tonight', 'how "
-    "are you'), answer it yourself using the special function \"chat\": "
-    '{"function": "chat", "args": {"response": "<your answer>"}}. '
-    "The response is spoken aloud by TTS, so: plain text only, no "
-    "markdown or code, concise (under 60 words), confident and dry-"
-    "witted, addressing the user as 'sir' occasionally. Never reply "
-    "with an empty actions list -- if nothing else fits, chat. You may "
-    "mix chat with real function calls when a request needs both."
-)
+# Character lives in persona.json (persona-as-data, the elizaOS idea) so
+# it can be edited without touching code; this is the fallback when the
+# file is missing/broken. Routing rules stay hardcoded below -- they're a
+# contract with the dispatcher, not personality.
+_DEFAULT_PERSONA = {
+    "name": "Jarvis",
+    "description": "a local desktop voice assistant in the style of JARVIS from Iron Man",
+    "address_as": "sir",
+    "style": [
+        "confident and dry-witted",
+        "concise -- answers are spoken aloud, keep them under 60 words",
+        "plain text only: no markdown, no code",
+        "address the user as 'sir' occasionally",
+    ],
+    "lore": [],
+}
+
+PERSONA_PATH = os.path.join(os.path.dirname(__file__), "persona.json")
+_persona_cache = {"mtime": None, "data": _DEFAULT_PERSONA}
+
+
+def _load_persona():
+    """mtime-cached persona.json load -- edits apply on the next command,
+    no restart. Any read/parse failure falls back to the default."""
+    try:
+        mtime = os.path.getmtime(PERSONA_PATH)
+        if mtime != _persona_cache["mtime"]:
+            with open(PERSONA_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = dict(_DEFAULT_PERSONA)
+            merged.update({k: v for k, v in data.items() if not k.startswith("_")})
+            _persona_cache.update(mtime=mtime, data=merged)
+    except Exception:
+        _persona_cache.update(mtime=None, data=_DEFAULT_PERSONA)
+    return _persona_cache["data"]
+
+
+def _base_prompt():
+    p = _load_persona()
+    style = "; ".join(p.get("style") or _DEFAULT_PERSONA["style"])
+    prompt = (
+        f"You are {p['name']}, {p['description']}. Read the user's request "
+        "and decide which of the available functions (if any) should be "
+        "called to satisfy it. A single request can map to several actions "
+        "in sequence -- include all of them in order.\n\n"
+        "CONVERSATIONAL MODE: if the request is NOT a command but a "
+        "question, opinion, or casual conversation (e.g. 'is quicksort "
+        "faster than mergesort', 'should I do the contest tonight', 'how "
+        "are you'), answer it yourself using the special function \"chat\": "
+        '{"function": "chat", "args": {"response": "<your answer>"}}. '
+        f"The response is spoken aloud by TTS. Your voice: {style}. "
+        "Never reply with an empty actions list -- if nothing else fits, "
+        "chat. You may mix chat with real function calls when a request "
+        "needs both.\n\n"
+        "MEMORY: you curate your own long-term memory. When the user "
+        "states a DURABLE personal fact (a name, a PR, a deadline, a "
+        "preference -- not a one-off command), include a remember_fact "
+        "call alongside whatever else you do, with a short stable "
+        "`subject` key (e.g. 'bench pr', 'exam date') so a later change "
+        "to the same subject replaces it."
+    )
+    lore = p.get("lore") or []
+    if lore:
+        prompt += "\n\nCharacter notes: " + "; ".join(lore) + "."
+    return prompt
 
 
 def _system_prompt():
-    prompt = BASE_PROMPT
+    prompt = _base_prompt()
+    # Core memory (self-curated durable facts) -- injected so both chat
+    # answers and routing see them; capped at ~175 tokens inside.
+    try:
+        import core_memory
+        block = core_memory.core_block()
+        if block:
+            prompt += "\n\n" + block
+    except Exception:
+        pass
     # Mood-aware persona: one dynamic line when a fresh (<18h) check-in
     # exists -- gentler when rough/low, brighter when good/high. Local
     # data, ~20 tokens, silently omitted when stale or unavailable.
